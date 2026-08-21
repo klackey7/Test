@@ -1,0 +1,233 @@
+---
+name: divert-cs-stock-check
+description: >
+  Check whether C&S Wholesale Grocers stocks the items on a research
+  spreadsheet, by driving the C&S sourcing portal
+  (https://divert.cssourcing.com) with the user's own logged-in browser
+  session. Searches each distinct UPC front5 from the research file, scrapes
+  the Product List results, matches them back to the research rows on
+  back5 == CsUPC, and produces a matches-only copy of the workbook with a
+  "No Buy" column. Use this skill WHENEVER the user has a research spreadsheet
+  (Coffees_and_Teas_Brands_-_RESEARCH.xlsx or any file in the same shape) and
+  wants to know which of those items C&S / divert carries. Trigger on phrases
+  like "does C&S stock these", "check divert for this list", "run the C&S
+  stock check", "which of these does divert carry", "check cssourcing", "run
+  the divert stock check on this file". This is scoped to divert.cssourcing.com
+  / C&S only — do not use it for Net Trade research (new-offer-research-agent),
+  floor comparisons (source-floor-price-compare), or bulk uploads
+  (trading-floor-bulk-upload-builder).
+---
+
+# Divert C&S Stock Check
+
+Take a research spreadsheet and find out which of its items C&S Wholesale
+Grocers carries, by searching the C&S sourcing portal at
+`https://divert.cssourcing.com`. The deliverable is a **new copy** of the
+research workbook containing only the matched rows, with all original columns
+preserved plus a single new **"No Buy"** column.
+
+This is a semi-automated Python + Playwright script, built on the same pattern
+as `nettrade_batch_fill.py`: a **headed** browser, a **manual login step**
+(the user logs in with their own C&S credentials), then an automated
+search → scrape → match → write loop. The user is present at each run to log
+in — the script never handles credentials.
+
+## Hard rules — read these first
+
+1. **NEVER guess a selector or a mapping.** The C&S portal DOM is not baked
+   into this skill. Every site selector starts UNSET. If the live DOM doesn't
+   match what the script expects, the script STOPS and tells you to inspect —
+   it does not invent a plausible selector and press on. This mirrors the
+   back5-collision lesson from the Net Trade build: a wrong result is worse
+   than a missing one.
+
+2. **The original upload is never touched.** Output is always a new file
+   (`..._STOCKED.xlsx`). The research file is read-only input.
+
+3. **Matches only.** Rows the site did not return are dropped from the output
+   entirely. This is deliberate and confirmed with the user, not an oversight.
+
+4. **The matching logic is confirmed — do not re-derive it.** front5, back5,
+   and the CsUPC comparison are specified below exactly. Do not change them
+   without asking the user.
+
+5. **Validate before a full run.** Confirm front5/back5 matching against a
+   handful of real site results (the `--stop-after-chunk 1` step) before
+   trusting a full ~370-search run.
+
+## Scope
+
+This skill is **C&S / divert.cssourcing.com only**. There is intentionally no
+generic multi-portal abstraction — the login flow, DOM, and search form are
+specific to this one site. Keep it that way.
+
+## Input file schema
+
+`Coffees_and_Teas_Brands_-_RESEARCH.xlsx` and future files in the same shape.
+Columns (order preserved in output):
+
+> UPC, BRAND, DESCRIPTION, SIZE, UOS, PACK, SHELF, LIST PRICE, YOUR COST,
+> ITEM WGT, ITEM HGT, ITEM LNG, ITM WIDTH, CASE HGT, CASE LNGT, CASE WIDTH,
+> ITEM CUBE, BLOCK, TIER, PALLET, CATEGORY 1, CATEGORY 2, CATEGORY 3
+
+Notes the script handles automatically:
+- **UPC is stored as an Excel number**, so leading zeros are sometimes
+  stripped (in the sample file: 2,144 rows at 12 digits, 629 at 11 digits,
+  2 at 10 digits). The script zero-pads every UPC to 12 characters.
+- **Fully blank spacer rows** (334 in the sample file) are skipped.
+- The UPC column is located by header name (`UPC`), not by position.
+
+## Confirmed matching logic (do not change without asking)
+
+1. Zero-pad every UPC to a 12-character string, left-padded with `"0"`.
+2. `front5` = characters at index `[1:6]` (0-indexed) of the padded UPC.
+   Example: `850031180208` → front5 `"50031"`.
+3. `back5` = the last 5 characters of the padded 12-digit UPC.
+4. Build the set of **distinct** front5 values across all UPC rows — dedupe,
+   and search **once per unique front5**, not once per row.
+
+### Matching a scraped result back to the research file
+For each scraped result row, take the site's **CsUPC**, normalize it to a
+5-character zero-padded string (`csupc5` — CsUPC may lose leading zeros as a
+number), and compare it to the `back5` of the research rows that share that
+front5. **Exact match = hit.** No fuzzy or partial matches — a wrong match is
+worse than a miss.
+
+> The `--stop-after-chunk 1` validation run prints the full derivation
+> (pad12 → back5 vs. CsUPC raw → csupc5) for a sample of matches, so you can
+> confirm whether CsUPC needs the zero-padding on the real site before
+> trusting the full run.
+
+## Site workflow
+
+1. Launch a **headed** Chromium browser and open
+   `https://divert.cssourcing.com/login`. **Wait for the user to log in
+   manually.** By default the script prints a prompt and blocks on Enter
+   (`press Enter once logged in`) — the login flow is unverified, so this is
+   the safe default. If a post-login marker element is confirmed, set
+   `SELECTORS["logged_in_marker"]` and the script will poll for it instead.
+2. Reach **Product Search** (via a confirmed nav selector, or a manual pause).
+   For each unique front5:
+   - Enter the front5 in the **"Upc"** search box, leave **DC = "All DC"**
+     (the default), click **Search**.
+   - Scrape the **Product List** table: DC, DcName, ItemCode, UPC, CsUPC,
+     Description, Pk/Sz, Type, QC Days, No Buy.
+   - Zero rows → skip silently (no output, no log for that front5).
+3. Add a **randomized 1–3 second delay** between searches (rate-limit
+   courtesy).
+4. Split the unique front5 values into **5 roughly-equal chunks**, processed
+   sequentially. **Save progress to disk after each chunk** so the run is
+   resumable if the browser session times out or the script crashes partway.
+   On restart the script detects the progress file and resumes from the next
+   unprocessed chunk.
+
+## Dedup across DCs
+
+A matched item can appear under multiple DCs in one search. Collapse these into
+**one output row per matched research item** (ignore which DC carried it). If
+**"No Buy"** differs across DCs for the same item, report all distinct values
+seen, comma-separated (e.g. `"No, Yes"`); if uniform, just the one value
+(e.g. `"No"`).
+
+## Output
+
+A new workbook, `<input basename>_STOCKED.xlsx` (e.g.
+`Coffees_and_Teas_Brands_-_RESEARCH_STOCKED.xlsx`), containing **only the
+matched rows**, with all original columns preserved plus one new **"No Buy"**
+column populated per the dedup rule above. Unmatched research rows are dropped.
+The original file is left untouched.
+
+## What is UNVERIFIED — confirm live, do not guess
+
+The C&S DOM has not been inspected. These must be confirmed on the real site
+via `--inspect` before a full run, and the script hard-stops until they are:
+
+- Exact selectors for: the **"Upc"** search input, the **DC** dropdown, the
+  **Search** button, and the **Product List** results table.
+- The login flow / what signals "logged in" (URL change? an element
+  appearing?). Default is the manual Enter prompt; set `logged_in_marker`
+  only if confirmed.
+- Whether **CsUPC** in the scraped table ever needs its own zero-padding
+  (confirm against a few real matched examples in the validation run before
+  trusting the comparison — the script already zero-pads defensively and
+  prints the raw vs. padded value so you can verify).
+
+## Workflow (run it in this order)
+
+### Step 0 — Confirm the file and dependencies
+Make sure the research file is present and dependencies are installed:
+```
+pip install playwright openpyxl
+playwright install chromium
+```
+
+### Step 1 — Discover the real DOM (`--inspect`)
+```
+python scripts/divert_stock_check.py --input RESEARCH.xlsx --inspect
+```
+A headed browser opens on the login page. **Log in manually.** Navigate to the
+Product Search page (run a search that returns some results so the results
+table is present), press Enter, and the script dumps every input, select,
+button, and table on the page. Use that output to fill in the `SELECTORS`
+block at the top of `scripts/divert_stock_check.py` with confirmed CSS
+selectors. **Do not guess — copy from what `--inspect` shows.**
+
+### Step 2 — Validate matching on the first chunk
+```
+python scripts/divert_stock_check.py --input RESEARCH.xlsx --stop-after-chunk 1
+```
+The pre-flight self-check verifies your selectors resolve on the live page
+(and refuses to run if any required one is unset or broken). It then processes
+only the first chunk, saves progress, writes a partial `..._STOCKED.xlsx`, and
+prints a **match validation sample** showing the front5/back5 → CsUPC
+derivation. Eyeball it: are the matches real? Does CsUPC need padding?
+
+### Step 3 — Resume and finish
+```
+python scripts/divert_stock_check.py --input RESEARCH.xlsx
+```
+Re-running the same command detects the progress file and resumes from the
+next unprocessed chunk — already-searched front5 values are not re-searched,
+and no duplicate output rows are produced. When all chunks are done it writes
+the final matches-only workbook.
+
+### Rebuild output without searching
+If searching is complete but you want to regenerate the workbook:
+```
+python scripts/divert_stock_check.py --input RESEARCH.xlsx --rebuild-output
+```
+
+## Success criteria
+
+- Running end-to-end against the real site with the real research file
+  produces the filtered `..._STOCKED.xlsx`.
+- front5/back5 matching is validated against a handful of real site results
+  (Step 2) before the full ~370-search run.
+- A chunk can be interrupted and resumed without re-searching completed front5
+  values or producing duplicate output rows.
+- No guessed selectors or invented business logic anywhere. If the live DOM
+  doesn't match what's assumed, the script stops and you ask the user.
+
+## Script
+
+### `scripts/divert_stock_check.py`
+The full implementation: research-file reader, front5 chunking, the resumable
+Playwright search loop, the Product List scraper (header-mapped, never
+positionally guessed), the back5==CsUPC matcher with cross-DC dedup, and the
+matches-only workbook writer. The `SELECTORS` block at the top is the only
+part that must be filled in per the live DOM; everything else is confirmed
+logic. Read the module docstring before the first run.
+
+## Operational notes
+
+- `~370` unique front5 searches is typical for a file this size. At a 1–3s
+  courtesy delay plus page load, budget roughly 15–25 minutes of wall time,
+  which is why chunked, resumable progress matters — a session timeout mid-run
+  costs only the current chunk.
+- The browser is **headed** and login is **manual** by design. Do not run
+  `--headless` for a real run; the user must be able to log in.
+- Progress lives in `<input basename>_progress.json`. Delete it to force a
+  clean re-run from scratch. It is invalidated automatically if the input file
+  or the front5 set changes.
+- `openpyxl` reads and writes the `.xlsx`; `playwright` (Chromium) drives the
+  site.

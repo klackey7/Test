@@ -377,6 +377,16 @@ def inspect_page(page):
     """Dump the interactive elements and tables on the current page so the
     real selectors can be identified. Run after login + reaching Product
     Search. Read-only; changes nothing."""
+    # Let any in-flight navigation/render finish before querying the DOM.
+    # If the user just clicked Search right before pressing Enter, the page
+    # may still be mid-navigation — querying too early destroys the execution
+    # context and crashes Playwright. Settle first, and retry once on that
+    # specific error rather than guessing anything about the page.
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        page.wait_for_timeout(1500)
+
     print("\n" + "=" * 70)
     print(f"INSPECT — current URL: {page.url}")
     print("=" * 70)
@@ -388,24 +398,34 @@ def inspect_page(page):
             "cls:e.getAttribute('class'), text:(e.innerText||'').trim().slice(0,40)})"
         )
 
+    def query_all(selector):
+        """query_selector_all with one retry if navigation raced us."""
+        try:
+            return page.query_selector_all(selector)
+        except Exception as e:
+            if "Execution context was destroyed" in str(e) or "navigat" in str(e).lower():
+                page.wait_for_timeout(2000)
+                return page.query_selector_all(selector)
+            raise
+
     print("\n--- <input> elements ---")
-    for el in page.query_selector_all("input"):
+    for el in query_all("input"):
         print("  ", attrs(el))
 
     print("\n--- <select> elements ---")
-    for el in page.query_selector_all("select"):
+    for el in query_all("select"):
         a = attrs(el)
         opts = [o.inner_text().strip() for o in el.query_selector_all("option")]
         print("  ", a, "options:", opts[:12])
 
     print("\n--- <button> / [type=submit] / <a> (clickables) ---")
-    for el in page.query_selector_all("button, input[type=submit], a"):
+    for el in query_all("button, input[type=submit], a"):
         a = attrs(el)
         if a.get("text") or a.get("id") or a.get("name"):
             print("  ", a)
 
     print("\n--- <table> elements (with first-row header cells) ---")
-    for idx, el in enumerate(page.query_selector_all("table")):
+    for idx, el in enumerate(query_all("table")):
         a = el.evaluate("e => ({id:e.id, cls:e.getAttribute('class')})")
         first = el.query_selector("tr")
         heads = []

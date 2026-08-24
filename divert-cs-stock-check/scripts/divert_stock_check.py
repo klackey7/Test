@@ -736,6 +736,7 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
                     "csupc_raw": res.get("CsUPC", ""),
                     "description": res.get("Description", ""),
                     "pk_sz": res.get("Pk/Sz", ""),
+                    "no_buy": res.get("No Buy", ""),
                 })
 
     # Print a validation sample so the user can eyeball the derivation before
@@ -855,7 +856,7 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
     ws2 = wb.create_sheet("Review Queue")
     ws2.append(list(headers) + ["Front5", "DC(s) seen", "Site UPC(s) seen",
                                  "CsUPC(s) seen", "Site Description(s)",
-                                 "Site Pk/Sz(s)"])
+                                 "Site Pk/Sz(s)", "No Buy(s) seen"])
     for ridx in sorted(review_map.keys()):
         entries = review_map[ridx]
         front5s = ", ".join(sorted({e["front5"] for e in entries}))
@@ -864,8 +865,9 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
         csupcs = ", ".join(sorted({str(e["csupc_raw"]) for e in entries if e["csupc_raw"]}))
         descs = ", ".join(sorted({e["description"] for e in entries if e["description"]}))
         pksz = ", ".join(sorted({e["pk_sz"] for e in entries if e["pk_sz"]}))
+        no_buys = ", ".join(sorted({e["no_buy"] for e in entries if e["no_buy"]}))
         ws2.append(list(rows[ridx]["values"]) +
-                   [front5s, dcs, site_upcs, csupcs, descs, pksz])
+                   [front5s, dcs, site_upcs, csupcs, descs, pksz, no_buys])
 
     n_vendor_lines = 0
     brand_idx = find_header_index(headers, "BRAND")

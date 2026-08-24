@@ -140,7 +140,9 @@ seen, comma-separated (e.g. `"No, Yes"`); if uniform, just the one value
 ## Output
 
 A new workbook, `<input basename>_STOCKED.xlsx` (e.g.
-`Coffees_and_Teas_Brands_-_RESEARCH_STOCKED.xlsx`), with two tabs:
+`Coffees_and_Teas_Brands_-_RESEARCH_STOCKED.xlsx`), with four tabs. The UPC
+column is rendered as a readable dashed UPC-A (`0-72310-00041-4`) in every
+tab that has one — display-only, matching always runs on the raw digits.
 
 - **Stocked** — matches-only, primary CsUPC-exact hits, all original columns
   preserved plus one new **"No Buy"** column populated per the dedup rule
@@ -150,13 +152,28 @@ A new workbook, `<input basename>_STOCKED.xlsx` (e.g.
   `50003-79769` but CsUPC `79774`). A research row whose back5 matches the
   site UPC column but never got a primary CsUPC hit on any scraped row would
   otherwise be silently dropped — instead it lands here with the front5,
-  DC(s), site UPC(s), CsUPC(s), description(s), and Pk/Sz(s) seen, so it can
-  be resolved in a quick, pre-narrowed pass instead of manually scanning the
-  full research file. Still an exact match, just against a different real
-  field — never fuzzy, and never merged into Stocked.
+  DC(s), site UPC(s), CsUPC(s), description(s), Pk/Sz(s), and **No Buy(s)**
+  seen, so it can be resolved in a quick, pre-narrowed pass instead of
+  manually scanning the full research file. Still an exact match, just
+  against a different real field — never fuzzy, and never merged into Stocked.
+- **Stocked Vendor Lines** — every original research row (matched or not, in
+  original file order) whose BRAND has at least one confirmed Stocked match —
+  the "load the whole line" view, since a vendor C&S carries even one item
+  from is worth considering in full for other clients. Based on the Stocked
+  tab only, not the Review Queue (still unconfirmed). Each row marked
+  **"Confirmed Stocked"** Yes/blank plus its **No Buy** value where applicable.
+- **Lookfor** — requested 2026-08-24: for any front5 with at least one
+  confirmed Stocked match (a proven vendor relationship), items C&S actually
+  carries under that front5 with **no representation at all** in the research
+  file — e.g. "ITO EN shows 2 matches, but C&S actually carries 7." Checked
+  against both back5 and the site UPC-column back5, so nothing already in
+  Stocked or Review Queue is double-counted. Deduped by (front5, CsUPC,
+  description); columns: Front5, Brand, Description, Pk/Sz, Type, CsUPC,
+  site ItemCode(s), site UPC(s), DC(s), DC Name(s), No Buy(s).
 
-Unmatched research rows not appearing in either tab are genuinely dropped —
-neither CsUPC nor the site UPC column matched anything. The original research
+Unmatched research rows not appearing in Stocked or Review Queue are
+genuinely dropped — neither CsUPC nor the site UPC column matched anything.
+The original research
 file is left untouched.
 
 ## What is UNVERIFIED — confirm live, do not guess

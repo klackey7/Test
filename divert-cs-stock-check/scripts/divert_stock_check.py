@@ -433,6 +433,7 @@ def inspect_page(page):
             print("  ", a)
 
     print("\n--- <table> elements (with first-row header cells) ---")
+    found_dc_upc_table = False
     for idx, el in enumerate(query_all("table")):
         a = el.evaluate("e => ({id:e.id, cls:e.getAttribute('class')})")
         first = el.query_selector("tr")
@@ -440,7 +441,46 @@ def inspect_page(page):
         if first:
             heads = [c.inner_text().strip()
                      for c in first.query_selector_all("th, td")]
+        if any("csupc" in h.lower().replace(" ", "") for h in heads):
+            found_dc_upc_table = True
         print(f"  table[{idx}]", a, "headers:", heads)
+
+    # Fallback: if no <table> contained the Product List headers, the grid
+    # may be rendered as non-semantic <div>-based markup instead (some ASP.NET
+    # grid widgets do this). Broaden the search rather than assume defeat.
+    if not found_dc_upc_table:
+        print("\n--- No <table> matched Product List headers — scanning for "
+              "text 'CsUPC' anywhere on the page (fallback for div-based "
+              "grids) ---")
+        try:
+            matches = page.evaluate(
+                """() => {
+                    const out = [];
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_ELEMENT);
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        const txt = (node.textContent || '');
+                        if (txt.includes('CsUPC') &&
+                            node.children.length > 0 &&
+                            node.children.length < 30) {
+                            out.push({tag: node.tagName, id: node.id,
+                                      cls: node.getAttribute('class'),
+                                      childCount: node.children.length});
+                        }
+                    }
+                    return out.slice(0, 15);
+                }"""
+            )
+            for m in matches:
+                print("  ", m)
+            if not matches:
+                print("  No element containing 'CsUPC' text found at all — "
+                      "results likely did not load before this dump. Re-run "
+                      "and confirm rows are visible on screen before "
+                      "pressing Enter.")
+        except Exception as e:
+            print(f"  Fallback scan failed: {e}")
 
     print("\n" + "=" * 70)
     print("Copy the confirmed selectors into the SELECTORS block, then re-run "
@@ -726,6 +766,22 @@ def main():
         goto_product_search(page)
 
         if args.inspect:
+            # results_table can only be discovered once real search results
+            # are on screen — make that an explicit, separate, impossible-to-
+            # skip step instead of folding it into "navigate to Product
+            # Search", which people (reasonably) read as just "get to the
+            # page", not "run a search on it."
+            input(
+                "\n>>> INSPECT MODE — before continuing, RUN AN ACTUAL SEARCH "
+                "in the browser window now:\n"
+                "      1. Click the 'Upc' box and type a UPC or partial UPC "
+                "(e.g. 10095)\n"
+                "      2. Click the 'Search' button\n"
+                "      3. WAIT until the Product List grid shows rows on "
+                "screen\n"
+                "    Only once you can SEE result rows in the browser, come "
+                "back here and press Enter... "
+            )
             inspect_page(page)
             browser.close()
             return

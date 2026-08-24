@@ -696,6 +696,63 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
     return out
 
 
+def diagnose_matching(rows, front5_index, prog):
+    """Root-cause a zero- (or low-) match run without guessing.
+
+    For each searched front5 that returned scraped rows, prints the
+    candidate research back5 values side by side with the scraped CsUPC
+    values (raw as scraped, and normalized via csupc5), plus the overlap
+    count. This makes it visible whether the two sets are simply disjoint
+    (genuinely not stocked) or whether they look shifted/misaligned (a real
+    bug), instead of assuming either without evidence.
+    """
+    print("\n" + "=" * 70)
+    print("DIAGNOSE — front5 candidates vs. scraped CsUPC")
+    print("=" * 70)
+
+    total_candidates = 0
+    total_scraped_rows = 0
+    total_overlap = 0
+    front5_with_results = 0
+
+    for f5 in sorted(prog["results"].keys()):
+        results = prog["results"][f5]
+        if not results:
+            continue
+        front5_with_results += 1
+        candidates = front5_index.get(f5, [])
+        cand_back5 = sorted({rows[i]["back5"] for i in candidates})
+        raw_csupc = sorted({r.get("CsUPC", "") for r in results})
+        norm_csupc = sorted({csupc5(r.get("CsUPC", "")) for r in results})
+        overlap = sorted(set(cand_back5) & set(norm_csupc))
+
+        total_candidates += len(candidates)
+        total_scraped_rows += len(results)
+        total_overlap += len(overlap)
+
+        print(f"\nfront5 {f5}: {len(candidates)} research candidates, "
+              f"{len(results)} scraped rows, {len(raw_csupc)} distinct CsUPC")
+        print(f"  research back5 (sample):   {cand_back5[:8]}")
+        print(f"  scraped CsUPC raw (sample): {raw_csupc[:8]}")
+        print(f"  scraped CsUPC normalized:   {norm_csupc[:8]}")
+        print(f"  overlap: {len(overlap)} {overlap[:8]}")
+
+    print("\n" + "=" * 70)
+    print(f"TOTALS: {front5_with_results} front5 had scraped results, "
+          f"{total_candidates} total research candidates across them, "
+          f"{total_scraped_rows} total scraped rows, "
+          f"{total_overlap} total back5/CsUPC overlaps found.")
+    print("=" * 70)
+    if total_overlap == 0 and total_scraped_rows > 0 and total_candidates > 0:
+        print(
+            "\nZero overlap despite real candidates AND real scraped data on "
+            "both sides — the back5/CsUPC formats likely don't line up "
+            "(e.g. a digit-count or offset mismatch). Compare a 'research "
+            "back5' sample above against its 'scraped CsUPC raw' sample by "
+            "eye. Do NOT guess a fix — report exactly what you see back."
+        )
+
+
 def write_output(headers, rows, no_buy_map, out_path):
     """Write a matches-only copy: original columns + a 'No Buy' column."""
     wb = openpyxl.Workbook()
@@ -749,6 +806,12 @@ def main():
     ap.add_argument("--rebuild-output", action="store_true",
                     help="Skip searching; just rebuild the output from an "
                          "existing complete progress file.")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="No browser, no output file. Reads the saved progress "
+                         "file and prints, per searched front5, the candidate "
+                         "research back5 values vs. the scraped CsUPC values "
+                         "side by side, so a zero-match run can be root-caused "
+                         "instead of guessed at.")
     args = ap.parse_args()
 
     out_path = args.out or default_out_path(args.input)
@@ -768,6 +831,14 @@ def main():
 
     chunks = chunk_list(unique_front5, args.chunks)
     print(f"  Split into {len(chunks)} chunks.")
+
+    # ---- Diagnose-only path (no browser, no output file) ----
+    if args.diagnose:
+        prog = load_progress(progress_path, chunks, args.input)
+        if not prog:
+            raise SystemExit("ERROR: no valid progress file to diagnose.")
+        diagnose_matching(rows, front5_index, prog)
+        return
 
     # ---- Rebuild-output-only path (no browser) ----
     if args.rebuild_output:

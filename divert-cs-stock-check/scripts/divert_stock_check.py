@@ -35,8 +35,14 @@ Usage:
     python divert_stock_check.py --input RESEARCH.xlsx
 
 Output:
-    <input basename>_STOCKED.xlsx   (matches only, original + "No Buy" column)
-    <input basename>_progress.json  (resume state; safe to delete when done)
+    <input basename>_STOCKED.xlsx      (internal: Stocked/Review Queue/Stocked
+                                        Vendor Lines/Lookfor tabs)
+    <input basename>_CS_STOCK_SUMMARY.xlsx  (account-manager summary, On
+                                        Offer + Ask Source)
+    <input basename>_FINAL_REVIEW.xlsx (account-manager-ready: source columns,
+                                        No Buy == "No" only, bold = case-code
+                                        match, plain = item-code match)
+    <input basename>_progress.json     (resume state; safe to delete when done)
 
 Dependencies:
     pip install playwright openpyxl
@@ -53,6 +59,7 @@ import time
 from datetime import datetime
 
 import openpyxl
+from openpyxl.styles import Font
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1302,6 +1309,110 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
     return len(out_rows)
 
 
+def _no_buy_is_clean_no(no_buy_str) -> bool:
+    """True only if every distinct No Buy value seen for a row is exactly
+    'No' (case-insensitive) — a single, unambiguous value. Confirmed
+    2026-08-24: the account-manager-ready Final Review deliberately drops
+    any row with a discrepancy across DCs (e.g. 'No' at one DC, 'Yes' at
+    another) rather than resolving it automatically — there are too many to
+    adjudicate one by one, and an inconsistent row isn't action-ready."""
+    vals = {v.strip().lower() for v in str(no_buy_str or "").split(",") if v.strip()}
+    return vals == {"no"}
+
+
+def _review_no_buy_is_clean_no(entries) -> bool:
+    """Same rule as _no_buy_is_clean_no, applied to a Review Queue row's
+    list of contributing scraped-row dicts instead of a pre-joined string."""
+    vals = {e.get("no_buy", "").strip().lower() for e in entries if e.get("no_buy", "").strip()}
+    return vals == {"no"}
+
+
+def write_final_review(headers, rows, no_buy_map, review_map, out_path):
+    """Write the account-manager-ready Final Review workbook — the shape
+    proven out by hand on the real Coffees & Teas run and confirmed
+    2026-08-24: same columns as the research file (no added columns, since
+    the account manager is used to seeing the source document and extra
+    analytical columns confuse rather than help), grouped by Brand with a
+    blank row between brand groups, one bold/plain visual marker in place
+    of a Status column.
+
+    Confirmed mapping of the user's own terms onto this skill's two exact
+    match tiers:
+      - "case code" match (definite)  -> the primary Stocked match, CsUPC
+        exact (back5 == CsUPC). Rendered BOLD.
+      - "item code" match (secondary) -> the Review Queue match, site UPC
+        column back5 only. Rendered PLAIN — the user still eyeballs these
+        for discrepancies before sending, exactly as they already do.
+
+    Both tiers are filtered to rows where No Buy is unambiguously "No"
+    (see _no_buy_is_clean_no) — a row with a Yes/No discrepancy across DCs,
+    or no No Buy value seen at all, is excluded rather than guessed at.
+
+    This is a SEPARATE, narrower document from the internal Stocked/Review
+    Queue/Lookfor workbook and the CS_STOCK_SUMMARY file — it never includes
+    Lookfor ("ask for it") items, which the user treats as a distinct
+    second-layer document, not part of this one.
+    """
+    brand_idx = find_header_index(headers, "BRAND")
+    desc_idx = find_header_index(headers, "DESCRIPTION")
+    upc_idx = find_header_index(headers, "UPC")
+
+    def display_values(row):
+        vals = list(row["values"])
+        if upc_idx is not None:
+            vals[upc_idx] = format_upc_display(row.get("pad12", ""), vals[upc_idx])
+        return vals
+
+    included = []  # (row_idx, bold)
+    for ridx in range(len(rows)):
+        if ridx in no_buy_map:
+            if _no_buy_is_clean_no(no_buy_map[ridx]):
+                included.append((ridx, True))
+        elif ridx in review_map:
+            if _review_no_buy_is_clean_no(review_map[ridx]):
+                included.append((ridx, False))
+
+    if brand_idx is None:
+        print("  WARNING: no 'BRAND' column found — Final Review rows will "
+              "not be grouped by brand.")
+
+    def sort_key(item):
+        ridx, _ = item
+        vals = rows[ridx]["values"]
+        brand = str(vals[brand_idx] or "").strip().upper() if brand_idx is not None else ""
+        desc = str(vals[desc_idx] or "").strip().upper() if desc_idx is not None else ""
+        return (brand, desc)
+
+    included.sort(key=sort_key)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Final Review"
+    ws.append(list(headers))
+    bold_font = Font(bold=True)
+
+    last_brand = None
+    n_bold = 0
+    n_plain = 0
+    for ridx, bold in included:
+        brand = (str(rows[ridx]["values"][brand_idx] or "").strip()
+                 if brand_idx is not None else "")
+        if brand_idx is not None and last_brand is not None and brand != last_brand:
+            ws.append([None] * len(headers))
+        last_brand = brand
+
+        ws.append(display_values(rows[ridx]))
+        if bold:
+            for cell in ws[ws.max_row]:
+                cell.font = bold_font
+            n_bold += 1
+        else:
+            n_plain += 1
+
+    wb.save(out_path)
+    return n_bold, n_plain
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1321,6 +1432,11 @@ def default_share_path(input_path):
     return f"{base}_CS_STOCK_SUMMARY{ext or '.xlsx'}"
 
 
+def default_final_review_path(input_path):
+    base, ext = os.path.splitext(input_path)
+    return f"{base}_FINAL_REVIEW{ext or '.xlsx'}"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="C&S (divert.cssourcing.com) stock-check automation.")
@@ -1330,6 +1446,12 @@ def main():
     ap.add_argument("--share-out", default=None,
                     help="Account-manager-ready summary file (default: "
                          "<input>_CS_STOCK_SUMMARY.xlsx).")
+    ap.add_argument("--final-out", default=None,
+                    help="Final Review workbook: source columns, filtered to "
+                         "No Buy == 'No' with no cross-DC discrepancy, bold "
+                         "for case-code (CsUPC) matches, plain for item-code "
+                         "(Review Queue) matches (default: "
+                         "<input>_FINAL_REVIEW.xlsx).")
     ap.add_argument("--progress", default=None,
                     help="Progress JSON path (default: <input>_progress.json).")
     ap.add_argument("--chunks", type=int, default=5,
@@ -1359,6 +1481,7 @@ def main():
 
     out_path = args.out or default_out_path(args.input)
     share_path = args.share_out or default_share_path(args.input)
+    final_path = args.final_out or default_final_review_path(args.input)
     progress_path = args.progress or default_progress_path(args.input)
 
     print("=" * 70)
@@ -1402,6 +1525,9 @@ def main():
         n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
         if n_share:
             print(f"Wrote {n_share}-row account-manager summary to {share_path}")
+        n_bold, n_plain = write_final_review(headers, rows, no_buy_map, review_map, final_path)
+        print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
+              f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
         return
 
     # ---- Load / init progress ----
@@ -1481,6 +1607,9 @@ def main():
     n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
     if n_share:
         print(f"Wrote {n_share}-row account-manager summary to {share_path}")
+    n_bold, n_plain = write_final_review(headers, rows, no_buy_map, review_map, final_path)
+    print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
+          f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "

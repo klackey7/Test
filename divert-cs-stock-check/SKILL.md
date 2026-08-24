@@ -99,14 +99,31 @@ it's legitimately "stocked." No existing tab applies that filter.
    original research columns, filtered to Stocked with **No Buy == "No"**
    exactly (plus Lookfor "ask source" items reformatted into the same
    columns), with bold/not-bold in place of a Status column.
-4. **Not yet automated — confirm before building.** An automated generator
-   for that exact shape hasn't been written, because the hand-assembly
-   involved judgment calls this skill can't infer from the one output file
-   alone: whether the not-bold rows came only from Review-Queue-confirmed
-   research rows or also from Lookfor / Stocked Vendor Lines finds
-   reformatted into the original schema, and whether "bold" means the whole
-   row or just the BRAND cell. Confirm both with the user before writing
-   this as code — do not guess it from a single sample file.
+4. **Automated 2026-08-24 as the "Final Review" output**, once the user
+   confirmed the two open questions with real detail:
+   - "Bold" is the **whole row**, not just the BRAND cell — confirmed by
+     checking `font.bold` across multiple columns of the same rows in the
+     user's real final file.
+   - The not-bold rows carry full original pricing/spec data (same as bold
+     rows), which rules out them being reformatted Lookfor items — Lookfor
+     items have no research-file pricing by definition. They are Review
+     Queue rows (site UPC-column match without a CsUPC match) the user
+     manually vetted and kept.
+   - The user's own vocabulary maps directly onto this skill's two exact
+     match tiers: **"case code" match = CsUPC = the primary Stocked match
+     (bold, definite)**; **"item code" match = the site's UPC column = the
+     Review Queue match (plain, still needs the user's own discrepancy
+     check)** — confirming the two-tier design was already correct.
+   - A new, previously unimplemented rule: exclude any row — Stocked or
+     Review Queue — whose aggregated No Buy value isn't unambiguously
+     `"No"` (a Yes/No discrepancy across DCs, or no value seen at all).
+     There are too many of these to adjudicate automatically, and an
+     inconsistent row isn't action-ready.
+   - The Lookfor / "ask source" concept stays a **separate, second-layer
+     document** (the existing Lookfor tab / CS_STOCK_SUMMARY "Ask Source"
+     rows) — never merged into Final Review.
+
+   See "Final Review" under Output below for the resulting format.
 
 ## Scope
 
@@ -286,6 +303,31 @@ Description:
 - **Pack/Size** combines the research file's separate PACK/SIZE/UOS columns
   (e.g. `12/15.50 FO`), matching the site's own Pk/Sz display convention.
 - **% Spread** = `(List Price − Your Cost) / List Price × 100`.
+
+### Final Review — the proven account-manager-ready shape
+
+Added 2026-08-24 after the user's real Coffees & Teas run showed the shape
+they actually needed: `<input basename>_FINAL_REVIEW.xlsx` (`--final-out` to
+override). No custom columns — the account manager is used to seeing the
+source document, and extra analytical columns confuse rather than help.
+
+- **Same columns as the research file**, in the same order. No added
+  columns — bold/plain carries the confidence signal instead of a Status
+  column.
+- **Rows included:** Stocked (case-code / CsUPC match) rows and Review
+  Queue (item-code / site UPC-column match) rows, **both filtered to a
+  clean, unambiguous `No Buy == "No"`** (`_no_buy_is_clean_no` /
+  `_review_no_buy_is_clean_no`) — any row with a Yes/No discrepancy across
+  DCs, or no No Buy value at all, is dropped. Never includes Lookfor items;
+  that stays a separate "ask the source" document.
+- **Bold = case-code (CsUPC) match — definite.** Plain = item-code (site
+  UPC column) match — the user still does a final manual pass over these
+  for discrepancies before sending, same as their existing process. Bold
+  applies to the whole row (confirmed against the user's real file, not
+  just the BRAND cell).
+- **Grouped by Brand, then Description**, with a blank row between brand
+  groups — matching the visual sectioning of the source file, without
+  needing to preserve the original file's own blank-row positions.
 
 ## What is UNVERIFIED — confirm live, do not guess
 

@@ -173,8 +173,25 @@ tab that has one — display-only, matching always runs on the raw digits.
 
 Unmatched research rows not appearing in Stocked or Review Queue are
 genuinely dropped — neither CsUPC nor the site UPC column matched anything.
-The original research
-file is left untouched.
+The original research file is left untouched.
+
+### Account-manager summary — a SEPARATE, shareable file
+
+Requested 2026-08-24: the account manager doesn't need the matching detail,
+just what C&S can stock and buy. `<input basename>_CS_STOCK_SUMMARY.xlsx`
+(`--share-out` to override) is written as its own file — never a tab in the
+internal workbook — with one sheet, one row per item, sorted by Brand then
+Description:
+
+| Brand | Description | Pack/Size | Your Cost | List Price | % Spread | Status |
+
+- Rows come from **Stocked** (`Status = "On Offer"`, full pricing from the
+  research file) and **Lookfor** (`Status = "Ask Source"`, pricing left
+  blank — there's none for an item that was never on the offer) only.
+  Review Queue rows are excluded — still unconfirmed, not for external eyes.
+- **Pack/Size** combines the research file's separate PACK/SIZE/UOS columns
+  (e.g. `12/15.50 FO`), matching the site's own Pk/Sz display convention.
+- **% Spread** = `(List Price − Your Cost) / List Price × 100`.
 
 ## What is UNVERIFIED — confirm live, do not guess
 

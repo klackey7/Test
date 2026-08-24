@@ -55,6 +55,59 @@ in — the script never handles credentials.
    handful of real site results (the `--stop-after-chunk 1` step) before
    trusting a full ~370-search run.
 
+## Lessons learned (2026-08-24 retrospective) — read before adding a tab or column
+
+Real usage exposed a gap between what this skill produces and what the user
+actually needed to hand the account manager, plus a genuinely new business
+rule that was never implemented as a filter. Captured here so the next
+change starts from the real requirement instead of re-discovering it.
+
+**What happened.** The internal workbook grew to 4-5 tabs (Stocked, Review
+Queue, Stocked Vendor Lines, Lookfor, optional Lookfor Audit) plus a
+separate `_CS_STOCK_SUMMARY.xlsx` file with its own column layout — each
+added in response to a real, well-evidenced need in the moment. But the
+document the user actually built and used with the account manager
+(`..._FINAL.xlsx`) was simpler than all of that: the **same 23-column
+schema as the original research file** (no custom columns), a subset of
+the original rows kept, the original blank spacer rows between vendor
+sections left in place, and a plain **bold vs. not-bold** marker on the
+BRAND cell instead of a Status text column (bold = on the original offer
+sheet **and** stocked; not bold = C&S stocks it but it wasn't on the offer).
+The user assembled this by hand from the richer output — "used the doc you
+put together to review the master doc, remove lines that CS didn't stock,
+and bold lines that match the offer sheet and CS stock" — and described the
+process as scope creep they had to recenter away from.
+
+**New rule this surfaces.** "No Buy" was only ever displayed/aggregated by
+this skill, never used as an exclusion filter. The user's actual final
+document also drops every row where No Buy isn't specifically `"No"` — a
+stocked-but-No-Buy-isn't-"No" item is not something C&S will actually sell,
+so it doesn't belong in an account-manager-facing deliverable even though
+it's legitimately "stocked." No existing tab applies that filter.
+
+**Revision for next time.**
+1. Before adding a new tab, column, or output file, confirm the exact final
+   shape the user needs — ask what they'll do with it and who sees it,
+   rather than inferring the shape from whatever problem was just surfaced.
+   Each artifact added here was justified in isolation; the sum was more
+   than the user needed to act on.
+2. Treat **Review Queue**, **Stocked Vendor Lines**, and **Lookfor Audit**
+   as internal diagnostics for validating a run, not deliverables to build
+   toward by default — useful for trusting the matching logic, not for a
+   customer-facing account manager.
+3. The account-manager-ready shape that was actually proven out by hand:
+   original research columns, filtered to Stocked with **No Buy == "No"**
+   exactly (plus Lookfor "ask source" items reformatted into the same
+   columns), with bold/not-bold in place of a Status column.
+4. **Not yet automated — confirm before building.** An automated generator
+   for that exact shape hasn't been written, because the hand-assembly
+   involved judgment calls this skill can't infer from the one output file
+   alone: whether the not-bold rows came only from Review-Queue-confirmed
+   research rows or also from Lookfor / Stocked Vendor Lines finds
+   reformatted into the original schema, and whether "bold" means the whole
+   row or just the BRAND cell. Confirm both with the user before writing
+   this as code — do not guess it from a single sample file.
+
 ## Scope
 
 This skill is **C&S / divert.cssourcing.com only**. There is intentionally no

@@ -140,10 +140,24 @@ seen, comma-separated (e.g. `"No, Yes"`); if uniform, just the one value
 ## Output
 
 A new workbook, `<input basename>_STOCKED.xlsx` (e.g.
-`Coffees_and_Teas_Brands_-_RESEARCH_STOCKED.xlsx`), containing **only the
-matched rows**, with all original columns preserved plus one new **"No Buy"**
-column populated per the dedup rule above. Unmatched research rows are dropped.
-The original file is left untouched.
+`Coffees_and_Teas_Brands_-_RESEARCH_STOCKED.xlsx`), with two tabs:
+
+- **Stocked** — matches-only, primary CsUPC-exact hits, all original columns
+  preserved plus one new **"No Buy"** column populated per the dedup rule
+  above. This is the confirmed list; the matching rule here is never relaxed.
+- **Review Queue** — confirmed 2026-08-24: a scraped row's own **UPC** column
+  back5 can genuinely disagree with that same row's **CsUPC** (e.g. UPC
+  `50003-79769` but CsUPC `79774`). A research row whose back5 matches the
+  site UPC column but never got a primary CsUPC hit on any scraped row would
+  otherwise be silently dropped — instead it lands here with the front5,
+  DC(s), site UPC(s), CsUPC(s), description(s), and Pk/Sz(s) seen, so it can
+  be resolved in a quick, pre-narrowed pass instead of manually scanning the
+  full research file. Still an exact match, just against a different real
+  field — never fuzzy, and never merged into Stocked.
+
+Unmatched research rows not appearing in either tab are genuinely dropped —
+neither CsUPC nor the site UPC column matched anything. The original research
+file is left untouched.
 
 ## What is UNVERIFIED — confirm live, do not guess
 

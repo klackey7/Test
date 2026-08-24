@@ -193,6 +193,23 @@ def csupc5(val) -> str:
     return d.zfill(5)
 
 
+def site_upc_back5(val) -> str:
+    """Back5 portion of the site's own scraped 'UPC' column, e.g.
+    '50003-79769' -> '79769'. This is a DIFFERENT real field than CsUPC —
+    confirmed 2026-08-24 that the two can genuinely disagree on the same
+    scraped row (e.g. UPC '50003-79769' with CsUPC '79774'). Used only for
+    the Review Queue (a second, still-exact match against a different real
+    field), never for the primary CsUPC-based match — do not conflate them.
+    """
+    s = str(val or "").strip()
+    if "-" in s:
+        tail = s.split("-")[-1]
+        if tail.isdigit() and len(tail) == 5:
+            return tail
+    d = to_digits(val)
+    return d[-5:] if len(d) >= 5 else ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Research file
 # ═══════════════════════════════════════════════════════════════════════════
@@ -654,13 +671,25 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
     """Match scraped results back to research rows.
 
     For each scraped row: front5 F and CsUPC -> csupc5 C5. A research row
-    sharing F whose back5 == C5 is a HIT. Dedup across DCs: one output row per
-    matched research row; "No Buy" = distinct values seen across all matching
-    scraped rows, comma-joined.
+    sharing F whose back5 == C5 is a HIT (primary match). Dedup across DCs:
+    one output row per matched research row; "No Buy" = distinct values seen
+    across all matching scraped rows, comma-joined.
 
-    Returns dict: research_row_index -> "No Buy" string.
+    SECOND, SEPARATE pass — the Review Queue: confirmed 2026-08-24 that a
+    scraped row's own 'UPC' column back5 can genuinely disagree with that
+    same row's CsUPC (e.g. UPC '50003-79769' but CsUPC '79774'). A research
+    row whose back5 matches the site UPC's back5, but never got a primary
+    CsUPC hit anywhere, is NOT silently dropped — it's flagged for review.
+    This is still an exact match, just against a different real field, so it
+    never touches the primary (CsUPC-only) matched set — no fuzzy matching.
+
+    Returns (no_buy_map, review_map):
+      no_buy_map — research_row_index -> "No Buy" string (primary matches).
+      review_map — research_row_index -> list of dicts (one per contributing
+        scraped row) with front5, dc, site_upc, csupc_raw, description, pk_sz.
     """
     matched = {}      # row_idx -> set of No Buy values
+    reviewed = {}      # row_idx -> list of contributing scraped-row dicts
     samples = []      # for validation printout
 
     for f5, results in prog["results"].items():
@@ -674,18 +703,35 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
 
         for res in results:
             c5 = csupc5(res.get("CsUPC", ""))
-            if not c5:
+            hit_rows = by_back5.get(c5) if c5 else None
+            if hit_rows:
+                no_buy = (res.get("No Buy") or "").strip()
+                for ridx in hit_rows:
+                    matched.setdefault(ridx, set())
+                    if no_buy != "":
+                        matched[ridx].add(no_buy)
+                    if len(samples) < verbose_sample:
+                        samples.append((f5, rows[ridx], res, c5))
                 continue
-            hit_rows = by_back5.get(c5)
-            if not hit_rows:
+
+            # No primary CsUPC hit for this row — check the site's own UPC
+            # column back5 as a second, still-exact match against a
+            # different real field.
+            site_b5 = site_upc_back5(res.get("UPC", ""))
+            if not site_b5:
                 continue
-            no_buy = (res.get("No Buy") or "").strip()
-            for ridx in hit_rows:
-                matched.setdefault(ridx, set())
-                if no_buy != "":
-                    matched[ridx].add(no_buy)
-                if len(samples) < verbose_sample:
-                    samples.append((f5, rows[ridx], res, c5))
+            near_hit_rows = by_back5.get(site_b5)
+            if not near_hit_rows:
+                continue
+            for ridx in near_hit_rows:
+                reviewed.setdefault(ridx, []).append({
+                    "front5": f5,
+                    "dc": res.get("DC", ""),
+                    "site_upc": res.get("UPC", ""),
+                    "csupc_raw": res.get("CsUPC", ""),
+                    "description": res.get("Description", ""),
+                    "pk_sz": res.get("Pk/Sz", ""),
+                })
 
     # Print a validation sample so the user can eyeball the derivation before
     # trusting a full run (front5/back5 vs site CsUPC).
@@ -706,7 +752,13 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
             out[ridx] = ", ".join(sorted(vals))
         else:
             out[ridx] = ""  # matched but No Buy blank across all DCs
-    return out
+
+    # A row that got a primary match is never also a review-queue entry,
+    # even if some other DC's row only partially agreed.
+    review_out = {ridx: entries for ridx, entries in reviewed.items()
+                  if ridx not in matched}
+
+    return out, review_out
 
 
 def diagnose_matching(rows, front5_index, prog):
@@ -766,22 +818,44 @@ def diagnose_matching(rows, front5_index, prog):
         )
 
 
-def write_output(headers, rows, no_buy_map, out_path):
-    """Write a matches-only copy: original columns + a 'No Buy' column."""
+def write_output(headers, rows, no_buy_map, review_map, out_path):
+    """Write the matches-only 'Stocked' tab plus a 'Review Queue' tab.
+
+    Stocked: original columns + 'No Buy', matches-only, primary CsUPC-exact
+    hits only — unaffected by anything in the review queue.
+
+    Review Queue: research rows where the site's own UPC-column back5 (a
+    different real field than CsUPC) matched, but no scraped row's CsUPC
+    ever did — so they'd otherwise be silently dropped. Never merged into
+    Stocked; the primary match rule stays exact-CsUPC-only.
+    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Stocked"
-
     ws.append(list(headers) + ["No Buy"])
 
     n = 0
-    # Preserve original row order among matched rows.
     for ridx in sorted(no_buy_map.keys()):
         ws.append(list(rows[ridx]["values"]) + [no_buy_map[ridx]])
         n += 1
 
+    ws2 = wb.create_sheet("Review Queue")
+    ws2.append(list(headers) + ["Front5", "DC(s) seen", "Site UPC(s) seen",
+                                 "CsUPC(s) seen", "Site Description(s)",
+                                 "Site Pk/Sz(s)"])
+    for ridx in sorted(review_map.keys()):
+        entries = review_map[ridx]
+        front5s = ", ".join(sorted({e["front5"] for e in entries}))
+        dcs = ", ".join(sorted({e["dc"] for e in entries if e["dc"]}))
+        site_upcs = ", ".join(sorted({e["site_upc"] for e in entries if e["site_upc"]}))
+        csupcs = ", ".join(sorted({str(e["csupc_raw"]) for e in entries if e["csupc_raw"]}))
+        descs = ", ".join(sorted({e["description"] for e in entries if e["description"]}))
+        pksz = ", ".join(sorted({e["pk_sz"] for e in entries if e["pk_sz"]}))
+        ws2.append(list(rows[ridx]["values"]) +
+                   [front5s, dcs, site_upcs, csupcs, descs, pksz])
+
     wb.save(out_path)
-    return n
+    return n, len(review_map)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -858,9 +932,10 @@ def main():
         prog = load_progress(progress_path, chunks, args.input)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
-        no_buy_map = match_and_report(rows, front5_index, prog)
-        n = write_output(headers, rows, no_buy_map, out_path)
-        print(f"\nWrote {n} matched rows to {out_path}")
+        no_buy_map, review_map = match_and_report(rows, front5_index, prog)
+        n, n_review = write_output(headers, rows, no_buy_map, review_map, out_path)
+        print(f"\nWrote {n} matched rows and {n_review} Review Queue rows "
+              f"to {out_path}")
         return
 
     # ---- Load / init progress ----
@@ -929,9 +1004,13 @@ def main():
         browser.close()
 
     # ---- Match + write output (always, so partial progress is usable) ----
-    no_buy_map = match_and_report(rows, front5_index, prog)
-    n = write_output(headers, rows, no_buy_map, out_path)
-    print(f"\nWrote {n} matched rows to {out_path}")
+    no_buy_map, review_map = match_and_report(rows, front5_index, prog)
+    n, n_review = write_output(headers, rows, no_buy_map, review_map, out_path)
+    print(f"\nWrote {n} matched rows and {n_review} Review Queue rows to {out_path}")
+    if n_review:
+        print(f"  {n_review} item(s) need a quick manual look in the "
+              "'Review Queue' tab — the site's UPC column matched but "
+              "CsUPC never did, so they weren't auto-confirmed as stocked.")
     if not finished:
         print("Run was stopped early / partial — re-run the same command to resume.")
     else:

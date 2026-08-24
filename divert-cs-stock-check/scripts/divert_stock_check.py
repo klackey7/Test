@@ -222,6 +222,16 @@ def is_blank_row(values) -> bool:
     return True
 
 
+def find_header_index(headers, name):
+    """Locate a column by header name (case-insensitive, trimmed). Returns
+    None if not found — callers decide whether that's fatal."""
+    target = name.strip().lower()
+    for i, h in enumerate(headers):
+        if h.strip().lower() == target:
+            return i
+    return None
+
+
 def read_research(path: str):
     """Read the research workbook.
 
@@ -242,12 +252,7 @@ def read_research(path: str):
 
     headers = [("" if h is None else str(h).strip()) for h in header_row]
 
-    # Locate the UPC column by header name (case-insensitive, trimmed).
-    upc_idx = None
-    for i, h in enumerate(headers):
-        if h.strip().lower() == "upc":
-            upc_idx = i
-            break
+    upc_idx = find_header_index(headers, "UPC")
     if upc_idx is None:
         raise SystemExit(
             "ERROR: could not find a 'UPC' column in the research file. "
@@ -819,7 +824,8 @@ def diagnose_matching(rows, front5_index, prog):
 
 
 def write_output(headers, rows, no_buy_map, review_map, out_path):
-    """Write the matches-only 'Stocked' tab plus a 'Review Queue' tab.
+    """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, and a
+    'Stocked Vendor Lines' tab.
 
     Stocked: original columns + 'No Buy', matches-only, primary CsUPC-exact
     hits only — unaffected by anything in the review queue.
@@ -828,6 +834,13 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
     different real field than CsUPC) matched, but no scraped row's CsUPC
     ever did — so they'd otherwise be silently dropped. Never merged into
     Stocked; the primary match rule stays exact-CsUPC-only.
+
+    Stocked Vendor Lines: every original research row (matched or not, in
+    original file order) whose BRAND has at least one confirmed Stocked
+    match — the "load the whole line" view, since a vendor C&S carries even
+    one item from is worth considering in full for other clients. Based on
+    the confirmed Stocked tab only, not the Review Queue (still unconfirmed).
+    Each row is marked whether it was itself one of the confirmed hits.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -854,8 +867,31 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
         ws2.append(list(rows[ridx]["values"]) +
                    [front5s, dcs, site_upcs, csupcs, descs, pksz])
 
+    n_vendor_lines = 0
+    brand_idx = find_header_index(headers, "BRAND")
+    if brand_idx is None:
+        print("  WARNING: no 'BRAND' column found — skipping 'Stocked Vendor "
+              f"Lines' tab. Headers seen: {headers}")
+    else:
+        qualifying_brands = {
+            str(rows[ridx]["values"][brand_idx] or "").strip().upper()
+            for ridx in no_buy_map.keys()
+        }
+        qualifying_brands.discard("")
+
+        ws3 = wb.create_sheet("Stocked Vendor Lines")
+        ws3.append(list(headers) + ["Confirmed Stocked", "No Buy"])
+        for ridx, row in enumerate(rows):
+            brand = str(row["values"][brand_idx] or "").strip().upper()
+            if brand not in qualifying_brands:
+                continue
+            is_hit = ridx in no_buy_map
+            ws3.append(list(row["values"]) +
+                       ["Yes" if is_hit else "", no_buy_map.get(ridx, "")])
+            n_vendor_lines += 1
+
     wb.save(out_path)
-    return n, len(review_map)
+    return n, len(review_map), n_vendor_lines
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -933,9 +969,9 @@ def main():
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
         no_buy_map, review_map = match_and_report(rows, front5_index, prog)
-        n, n_review = write_output(headers, rows, no_buy_map, review_map, out_path)
-        print(f"\nWrote {n} matched rows and {n_review} Review Queue rows "
-              f"to {out_path}")
+        n, n_review, n_vendor = write_output(headers, rows, no_buy_map, review_map, out_path)
+        print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, and "
+              f"{n_vendor} Stocked Vendor Lines rows to {out_path}")
         return
 
     # ---- Load / init progress ----
@@ -1005,8 +1041,9 @@ def main():
 
     # ---- Match + write output (always, so partial progress is usable) ----
     no_buy_map, review_map = match_and_report(rows, front5_index, prog)
-    n, n_review = write_output(headers, rows, no_buy_map, review_map, out_path)
-    print(f"\nWrote {n} matched rows and {n_review} Review Queue rows to {out_path}")
+    n, n_review, n_vendor = write_output(headers, rows, no_buy_map, review_map, out_path)
+    print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, and "
+          f"{n_vendor} Stocked Vendor Lines rows to {out_path}")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "

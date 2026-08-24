@@ -99,6 +99,13 @@ DC_VALUE = "All DC"
 
 LOGIN_URL = "https://divert.cssourcing.com/login"
 
+# Confirmed 2026-08-24 via manual --inspect: searching "10095" reliably
+# returns many Product List rows on the live site. Used only as a probe
+# search during the pre-flight self-check, since the results table does not
+# exist in the DOM until at least one search has been run — not used for
+# any real front5 lookup.
+PROBE_FRONT5 = "10095"
+
 # Expected Product List column headers (normalized key -> canonical name).
 # Header text is matched by normalizing (lowercase, whitespace removed) so
 # minor spacing differences don't break the mapping. If the live table's
@@ -329,27 +336,58 @@ def goto_product_search(page):
         )
 
 
+def _check_selector(page, key, problems):
+    """Check one selector; append a problem message and return False if it
+    doesn't resolve. Returns True if it resolves cleanly."""
+    sel = SELECTORS.get(key)
+    if not sel:
+        problems.append(f"  - '{key}' is UNSET in the SELECTORS block.")
+        return False
+    try:
+        el = page.query_selector(sel)
+    except Exception as e:  # invalid selector syntax, etc.
+        problems.append(f"  - '{key}' selector '{sel}' errored: {e}")
+        return False
+    if el is None:
+        problems.append(
+            f"  - '{key}' selector '{sel}' did not match any element "
+            "on the current page."
+        )
+        return False
+    return True
+
+
 def verify_selectors(page):
     """Pre-flight self-check. HARD STOP if any REQUIRED selector is unset or
     does not resolve on the current page. This is the gate that prevents a
-    full run on guessed selectors."""
-    required = ["upc_input", "search_button", "results_table"]
+    full run on guessed selectors.
+
+    results_table only exists in the DOM after a search has run (confirmed
+    via --inspect: the bare Product Search page has no such table). So this
+    runs one real probe search — using the already-verified upc_input and
+    search_button — before checking for results_table, rather than checking
+    for it on a page where it could never legitimately be present yet.
+    """
     problems = []
-    for key in required:
-        sel = SELECTORS.get(key)
-        if not sel:
-            problems.append(f"  - '{key}' is UNSET in the SELECTORS block.")
-            continue
+
+    upc_ok = _check_selector(page, "upc_input", problems)
+    search_ok = _check_selector(page, "search_button", problems)
+
+    if upc_ok and search_ok:
+        page.fill(SELECTORS["upc_input"], PROBE_FRONT5)
+        page.click(SELECTORS["search_button"])
         try:
-            el = page.query_selector(sel)
-        except Exception as e:  # invalid selector syntax, etc.
-            problems.append(f"  - '{key}' selector '{sel}' errored: {e}")
-            continue
-        if el is None:
-            problems.append(
-                f"  - '{key}' selector '{sel}' did not match any element "
-                "on the current page."
-            )
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            page.wait_for_timeout(2000)
+        _check_selector(page, "results_table", problems)
+    else:
+        # Can't probe without a working search box/button — report
+        # results_table as unverifiable rather than silently skipping it.
+        problems.append(
+            "  - 'results_table' could not be checked: upc_input/"
+            "search_button must resolve first to run the probe search."
+        )
 
     # Optional selectors: if set, they must resolve too (a set-but-broken
     # selector is a silent bug we won't tolerate).

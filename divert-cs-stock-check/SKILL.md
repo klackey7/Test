@@ -194,6 +194,20 @@ tab that has one — display-only, matching always runs on the raw digits.
   reason. Word-overlap remains only as a fallback when the research file
   has no BRAND column at all.
 
+  **Deduping, fixed 2026-08-24:** keyed strictly on `(front5, CsUPC)` —
+  CsUPC is C&S's own item code within that front5, the real identity — not
+  on description. The same physical item scraped from different DCs can
+  carry cosmetic description drift (a stray leading/trailing `*`, a
+  truncated ending), which fragmented into apparent duplicate rows when
+  description was part of the key. Descriptions now aggregate into a set
+  like every other cross-DC field, with the longest one shown (avoids a
+  truncated `4P` when `4PK` was also seen).
+
+  **UPC = CsUPC column, added 2026-08-24:** every Lookfor row (and the
+  account-manager summary) carries an identifying `front5-CsUPC` pair —
+  the same identifier C&S itself displays — since there's nothing to hand
+  the source without one.
+
 Unmatched research rows not appearing in Stocked or Review Queue are
 genuinely dropped — neither CsUPC nor the site UPC column matched anything.
 The original research file is left untouched.
@@ -206,12 +220,16 @@ just what C&S can stock and buy. `<input basename>_CS_STOCK_SUMMARY.xlsx`
 internal workbook — with one sheet, one row per item, sorted by Brand then
 Description:
 
-| Brand | Description | Pack/Size | Your Cost | List Price | % Spread | Status |
+| Brand | Description | UPC = CsUPC | Pack/Size | Your Cost | List Price | % Spread | Status |
 
 - Rows come from **Stocked** (`Status = "On Offer"`, full pricing from the
   research file) and **Lookfor** (`Status = "Ask Source"`, pricing left
   blank — there's none for an item that was never on the offer) only.
   Review Queue rows are excluded — still unconfirmed, not for external eyes.
+- **UPC = CsUPC**, added 2026-08-24: the research file's own dashed UPC for
+  "On Offer" rows; the site's own `front5-CsUPC` pair for "Ask Source" rows,
+  since those have no research-file UPC by definition — needed so there's
+  something concrete to hand the source when asking for an item.
 - **Pack/Size** combines the research file's separate PACK/SIZE/UOS columns
   (e.g. `12/15.50 FO`), matching the site's own Pk/Sz display convention.
 - **% Spread** = `(List Price − Your Cost) / List Price × 100`.

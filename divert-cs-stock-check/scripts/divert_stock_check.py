@@ -220,6 +220,25 @@ def site_upc_back5(val) -> str:
     return d[-5:] if len(d) >= 5 else ""
 
 
+# Generic filler words common across grocery descriptions regardless of
+# vendor — excluded so they can't create a false relevance match between
+# two genuinely unrelated product lines that happen to share a front5.
+_DESCRIPTION_STOPWORDS = {
+    "AND", "THE", "FOR", "WITH", "NEW", "PER", "ALL", "ORIG", "ORIGINAL",
+    "FRESH", "PACK", "SIZE", "CASE", "EACH",
+}
+
+
+def significant_tokens(text) -> set:
+    """Meaningful uppercase word tokens from a description, for the Lookfor
+    relevance filter — NOT used for identity matching (that stays strictly
+    exact-digit based). Drops punctuation, pure numbers, short tokens
+    (<3 chars), and common cross-vendor filler words."""
+    s = str(text or "").upper()
+    words = re.findall(r"[A-Z]+", s)
+    return {w for w in words if len(w) >= 3 and w not in _DESCRIPTION_STOPWORDS}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Research file
 # ═══════════════════════════════════════════════════════════════════════════
@@ -682,7 +701,8 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
 # Matching + output
 # ═══════════════════════════════════════════════════════════════════════════
 
-def match_and_report(rows, front5_index, prog, brand_idx=None, verbose_sample=8):
+def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
+                     verbose_sample=8):
     """Match scraped results back to research rows.
 
     For each scraped row: front5 F and CsUPC -> csupc5 C5. A research row
@@ -709,6 +729,20 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, verbose_sample=8)
     e.g. "ITO EN shows 2 matches, but C&S actually carries 7" is exactly
     what this surfaces. brand_idx (optional) pulls the vendor's own BRAND
     label from any research row sharing that front5, for display only.
+
+    RELEVANCE FILTER, confirmed 2026-08-24: a front5 (manufacturer prefix)
+    is not always exclusive to one vendor — e.g. JOYBA's front5 also
+    carries an unrelated canned-goods line (sliced beets, canned peaches)
+    on the real site. A front5 having one confirmed hit does NOT mean
+    everything else under it is the same vendor. desc_idx (optional) is
+    used to build a per-front5 vocabulary of significant words from the
+    research file's OWN Description for every row sharing that front5
+    (the vendor's real product line, ground truth — not guessed). A
+    Lookfor candidate is kept only if its scraped Description shares at
+    least one significant word with that vocabulary; if desc_idx is None
+    or that front5 has no describable research rows, its Lookfor
+    candidates are excluded rather than risking irrelevant noise in a
+    client-facing list.
 
     Returns (no_buy_map, review_map, lookfor_list):
       no_buy_map — research_row_index -> "No Buy" string (primary matches).
@@ -803,6 +837,15 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, verbose_sample=8)
         if brand_idx is not None and candidates:
             brand = str(rows[candidates[0]]["values"][brand_idx] or "").strip()
 
+        # Relevance vocabulary: significant words from THIS front5's own
+        # research-file Descriptions (the vendor's real product line, ground
+        # truth). A front5 can be shared by unrelated vendors, so a Lookfor
+        # candidate must share real vocabulary, not just the search key.
+        reference_vocab = set()
+        if desc_idx is not None:
+            for ridx in candidates:
+                reference_vocab |= significant_tokens(rows[ridx]["values"][desc_idx])
+
         for res in prog["results"].get(f5, []):
             c5 = csupc5(res.get("CsUPC", ""))
             if not c5 or c5 in offer_back5s:
@@ -811,6 +854,9 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, verbose_sample=8)
             if site_b5 and site_b5 in offer_back5s:
                 continue  # already surfaced via Stocked or Review Queue
             description = (res.get("Description") or "").strip()
+            if not (significant_tokens(description) & reference_vocab):
+                continue  # no shared vocabulary — likely an unrelated
+                          # vendor sharing this front5, not this brand's line
             key = (f5, c5, description)
             entry = lookfor.setdefault(key, {
                 "front5": f5, "brand": brand, "description": description,
@@ -1157,6 +1203,7 @@ def main():
     chunks = chunk_list(unique_front5, args.chunks)
     print(f"  Split into {len(chunks)} chunks.")
     brand_idx = find_header_index(headers, "BRAND")
+    desc_idx = find_header_index(headers, "DESCRIPTION")
 
     # ---- Diagnose-only path (no browser, no output file) ----
     if args.diagnose:
@@ -1172,7 +1219,7 @@ def main():
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
         no_buy_map, review_map, lookfor_list = match_and_report(
-            rows, front5_index, prog, brand_idx=brand_idx)
+            rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
         n, n_review, n_vendor, n_lookfor = write_output(
             headers, rows, no_buy_map, review_map, lookfor_list, out_path)
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
@@ -1250,7 +1297,7 @@ def main():
 
     # ---- Match + write output (always, so partial progress is usable) ----
     no_buy_map, review_map, lookfor_list = match_and_report(
-        rows, front5_index, prog, brand_idx=brand_idx)
+        rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
     n, n_review, n_vendor, n_lookfor = write_output(
         headers, rows, no_buy_map, review_map, lookfor_list, out_path)
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "

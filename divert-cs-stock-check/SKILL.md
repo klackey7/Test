@@ -170,6 +170,14 @@ tab that has one — display-only, matching always runs on the raw digits.
   Stocked or Review Queue is double-counted. Deduped by (front5, CsUPC,
   description); columns: Front5, Brand, Description, Pk/Sz, Type, CsUPC,
   site ItemCode(s), site UPC(s), DC(s), DC Name(s), No Buy(s).
+  **Relevance filter, confirmed 2026-08-24:** a front5 is not always
+  exclusive to one vendor — JOYBA's front5 also carries an unrelated
+  canned-goods line (sliced beets, canned peaches) on the real site. A
+  candidate is kept only if its scraped Description shares at least one
+  significant word (via `significant_tokens()`) with the vocabulary built
+  from the research file's own Description for every row sharing that
+  front5 — the vendor's real product line, not a guess. No describable
+  research rows for a front5 → its candidates are excluded, not included.
 
 Unmatched research rows not appearing in Stocked or Review Queue are
 genuinely dropped — neither CsUPC nor the site UPC column matched anything.

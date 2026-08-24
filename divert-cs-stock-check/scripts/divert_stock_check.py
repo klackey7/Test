@@ -67,15 +67,23 @@ import openpyxl
 # Use any valid CSS selector, e.g. "#UpcSearch", "input[name='Upc']",
 # "table.product-list". Prefer id/name attributes over positional selectors.
 SELECTORS = {
-    # REQUIRED — the "Upc" search text box on the Product Search page.
-    "upc_input": None,
-    # REQUIRED — the Search button that submits the query.
-    "search_button": None,
-    # REQUIRED — the Product List results <table> element.
+    # REQUIRED — confirmed 2026-08-24 via --inspect on the real login/search
+    # page (this ASP.NET site swaps search content into the same /login URL
+    # via postback rather than navigating to a new URL).
+    "upc_input": "#MainContent_upc",
+    # REQUIRED — confirmed 2026-08-24 via --inspect.
+    "search_button": "#MainContent_search_btn",
+    # REQUIRED — the Product List results <table> element. STILL UNCONFIRMED:
+    # no search was executed before the first --inspect dump, so no results
+    # table was present in the DOM. Confirm with a follow-up --inspect run
+    # where a real search is executed first.
     "results_table": None,
-    # OPTIONAL — the DC dropdown <select>. Leave None to accept the site's
-    # default (spec says DC = "All DC"). Set it only if the default is not
-    # already "All DC" and you must select it explicitly.
+    # OPTIONAL — the DC dropdown is NOT a plain <select> on this site (it's a
+    # custom Infragistics widget — no <select> elements were found at all).
+    # The inspected dump shows "All DC" as the first/default option, matching
+    # the spec's "leave DC = All DC" default, so leaving this unset should be
+    # correct. CONFIRM once real search results come back for a DC-agnostic
+    # front5 that a mix of DCs appears (proving "All DC" was really in effect).
     "dc_dropdown": None,
     # OPTIONAL — a link/button that navigates to Product Search after login.
     # Leave None to instead pause and let the user navigate there manually.

@@ -73,17 +73,17 @@ SELECTORS = {
     "upc_input": "#MainContent_upc",
     # REQUIRED — confirmed 2026-08-24 via --inspect.
     "search_button": "#MainContent_search_btn",
-    # REQUIRED — the Product List results <table> element. STILL UNCONFIRMED:
-    # no search was executed before the first --inspect dump, so no results
-    # table was present in the DOM. Confirm with a follow-up --inspect run
-    # where a real search is executed first.
-    "results_table": None,
-    # OPTIONAL — the DC dropdown is NOT a plain <select> on this site (it's a
-    # custom Infragistics widget — no <select> elements were found at all).
-    # The inspected dump shows "All DC" as the first/default option, matching
-    # the spec's "leave DC = All DC" default, so leaving this unset should be
-    # correct. CONFIRM once real search results come back for a DC-agnostic
-    # front5 that a mix of DCs appears (proving "All DC" was really in effect).
+    # REQUIRED — confirmed 2026-08-24 via --inspect with a real search
+    # ("10095") executed first. table[60] in the dump: id='MainContent_product_item',
+    # headers exactly ['DC', 'DcName', 'ItemCode', 'UPC', 'CsUPC', 'Description',
+    # 'Pk/Sz', 'Type', 'QC Days', 'No Buy'].
+    "results_table": "#MainContent_product_item",
+    # OPTIONAL — CONFIRMED 2026-08-24. The DC dropdown is NOT a plain <select>
+    # on this site (it's a custom Infragistics widget — no <select> elements
+    # exist at all). A real search for "10095" returned results from 20+
+    # distinct DCs (01024, 01A01, 06066, 07067, 15602, 15603, 15606, 15607,
+    # 15610, 15614, 15630, ...) without touching this control, proving "All DC"
+    # is already in effect by default. Leave unset.
     "dc_dropdown": None,
     # OPTIONAL — a link/button that navigates to Product Search after login.
     # Leave None to instead pause and let the user navigate there manually.

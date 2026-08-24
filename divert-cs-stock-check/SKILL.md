@@ -170,14 +170,29 @@ tab that has one — display-only, matching always runs on the raw digits.
   Stocked or Review Queue is double-counted. Deduped by (front5, CsUPC,
   description); columns: Front5, Brand, Description, Pk/Sz, Type, CsUPC,
   site ItemCode(s), site UPC(s), DC(s), DC Name(s), No Buy(s).
-  **Relevance filter, confirmed 2026-08-24:** a front5 is not always
-  exclusive to one vendor — JOYBA's front5 also carries an unrelated
-  canned-goods line (sliced beets, canned peaches) on the real site. A
-  candidate is kept only if its scraped Description shares at least one
-  significant word (via `significant_tokens()`) with the vocabulary built
-  from the research file's own Description for every row sharing that
-  front5 — the vendor's real product line, not a guess. No describable
-  research rows for a front5 → its candidates are excluded, not included.
+  **Relevance filter — brand-anchored, revised 2026-08-24.** A front5 is
+  not always exclusive to one vendor: JOYBA is a Del Monte brand, so its
+  front5 also carries Del Monte's canned goods. Word-overlap filtering
+  failed here because the two lines share generic fruit/beverage vocabulary
+  (`DM BBL APL FRT WTRMLN GEL` shares BBL and FRT with `JOYBA BBL … DRGN
+  FRT`; `DM DICE MANGO LT SYRP` shares MANGO).
+
+  The working signal is the **brand token every real C&S description leads
+  with** — `BIGLOW RED RSPBRRY`, `BTLLI EXTRA VIRGIN OLIVE OIL`,
+  `*JOYBA BBL RASP…`, `DM CUT GREEN BEANS`. A candidate is kept only if
+  some token identifies it as one of the brands the research file lists
+  under that front5. Since C&S abbreviates by dropping vowels at varying
+  depth, matching uses **consonant skeletons** with a subsequence test
+  (`consonant_skeleton` + `brand_token_matches`): BIGELOW/BIGLOW/BGLW all
+  reduce to `BGLW`, BOTTICELLI accepts `BTLLI`, CLEANSE accepts `CLNCSE`.
+  A shared first letter is required and 2-char skeletons use a stricter
+  prefix test, so `DM`/`DELMONTE`/`DLMNT` can never match `JOYBA`.
+
+  Nothing is silently dropped: kept rows carry a **"Matched On"** column,
+  the run prints how many were excluded, and `--lookfor-audit` adds a
+  **"Lookfor Audit (excluded)"** tab listing every exclusion with its
+  reason. Word-overlap remains only as a fallback when the research file
+  has no BRAND column at all.
 
 Unmatched research rows not appearing in Stocked or Review Queue are
 genuinely dropped — neither CsUPC nor the site UPC column matched anything.

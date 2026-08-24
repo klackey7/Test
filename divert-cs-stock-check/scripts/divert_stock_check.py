@@ -239,6 +239,70 @@ def significant_tokens(text) -> set:
     return {w for w in words if len(w) >= 3 and w not in _DESCRIPTION_STOPWORDS}
 
 
+# Corporate-suffix noise in the research file's BRAND column — these carry
+# no vendor identity, so they must never anchor a brand match.
+_BRAND_STOPWORDS = {"LLC", "INC", "CORP", "CO", "LTD", "COMPANY", "THE",
+                    "AND", "BRANDS"}
+
+
+def consonant_skeleton(word) -> str:
+    """First letter, then all consonants — e.g. BIGELOW -> 'BGLW'.
+
+    C&S abbreviates descriptions by dropping vowels, at varying depth for
+    the same vendor (BIGELOW -> BIGLOW -> BGLW; BOTTICELLI -> BTLLI;
+    CLEANSE -> CLNCSE). Reducing both sides to a consonant skeleton
+    normalizes across that, so one brand's many spellings collapse together
+    while genuinely different brands stay apart.
+    """
+    w = re.sub(r"[^A-Z]", "", str(word or "").upper())
+    if not w:
+        return ""
+    return w[0] + "".join(c for c in w[1:] if c not in "AEIOU")
+
+
+def _is_subsequence(needle: str, haystack: str) -> bool:
+    """True if every char of needle appears in haystack in order."""
+    it = iter(haystack)
+    return all(c in it for c in needle)
+
+
+def brand_token_matches(brand_word, token) -> bool:
+    """True if a site-description token plausibly IS this brand word, via
+    consonant-skeleton subsequence. Requires the same first letter, so
+    'DM'/'DELMONTE' can never match 'JOYBA'. Two-letter skeletons use a
+    stricter prefix test, since they're too short to be safe as a
+    subsequence."""
+    sa = consonant_skeleton(brand_word)
+    sb = consonant_skeleton(token)
+    if len(sa) < 2 or len(sb) < 2 or sa[0] != sb[0]:
+        return False
+    short, long_ = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+    if len(short) == 2:
+        return long_.startswith(short)
+    return _is_subsequence(short, long_)
+
+
+def matched_brand_word(description, brands):
+    """Return the brand word a description's leading tokens identify it as,
+    or None. Confirmed 2026-08-24 against every real scraped description
+    collected: C&S descriptions lead with a brand abbreviation
+    ('BIGLOW RED RSPBRRY', 'BTLLI EXTRA VIRGIN OLIVE OIL',
+    'CLNCSE ORG MNT HNY YRB MT T', '*JOYBA BBL RASP...',
+    'DM CUT GREEN BEANS'). That token is the one field that separates two
+    unrelated vendors sharing a front5 — JOYBA is a Del Monte brand, so
+    their manufacturer prefix and much of their fruit/beverage vocabulary
+    genuinely overlap, and only the brand token tells them apart."""
+    tokens = re.findall(r"[A-Z]+", str(description or "").upper())
+    for brand in brands:
+        for bw in re.findall(r"[A-Z]+", str(brand or "").upper()):
+            if len(bw) < 2 or bw in _BRAND_STOPWORDS:
+                continue
+            for t in tokens:
+                if brand_token_matches(bw, t):
+                    return bw
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Research file
 # ═══════════════════════════════════════════════════════════════════════════
@@ -730,28 +794,38 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
     what this surfaces. brand_idx (optional) pulls the vendor's own BRAND
     label from any research row sharing that front5, for display only.
 
-    RELEVANCE FILTER, confirmed 2026-08-24: a front5 (manufacturer prefix)
-    is not always exclusive to one vendor — e.g. JOYBA's front5 also
-    carries an unrelated canned-goods line (sliced beets, canned peaches)
-    on the real site. A front5 having one confirmed hit does NOT mean
-    everything else under it is the same vendor. desc_idx (optional) is
-    used to build a per-front5 vocabulary of significant words from the
-    research file's OWN Description for every row sharing that front5
-    (the vendor's real product line, ground truth — not guessed). A
-    Lookfor candidate is kept only if its scraped Description shares at
-    least one significant word with that vocabulary; if desc_idx is None
-    or that front5 has no describable research rows, its Lookfor
-    candidates are excluded rather than risking irrelevant noise in a
-    client-facing list.
+    RELEVANCE FILTER, revised 2026-08-24: a front5 (manufacturer prefix) is
+    not always exclusive to one vendor. JOYBA is a Del Monte brand, so its
+    front5 also carries Del Monte's canned-goods line (sliced beets, green
+    beans, canned peaches) — and the two lines share plenty of generic
+    fruit/beverage vocabulary (FRT, BBL, MANGO, LMND), so a word-overlap
+    test let that noise through into a client-facing list.
 
-    Returns (no_buy_map, review_map, lookfor_list):
+    The rule is now brand-anchored: every real C&S description observed
+    leads with a brand abbreviation ('BIGLOW RED RSPBRRY', 'BTLLI EXTRA
+    VIRGIN OLIVE OIL', '*JOYBA BBL RASP...', 'DM CUT GREEN BEANS'), and
+    that token is what actually separates two vendors sharing a front5. A
+    candidate is kept only if some token in its description identifies it
+    as one of the brands the research file lists under that front5, via
+    consonant-skeleton subsequence matching (see brand_token_matches) so
+    C&S's vowel-dropping abbreviations still match. Word-overlap survives
+    only as a fallback when the research file has no BRAND column at all.
+
+    Nothing is silently discarded: every excluded candidate is returned in
+    lookfor_rejected with the reason, surfaced in the run summary, and
+    writable to an audit tab.
+
+    Returns (no_buy_map, review_map, lookfor_list, lookfor_rejected):
       no_buy_map — research_row_index -> "No Buy" string (primary matches).
       review_map — research_row_index -> list of dicts (one per contributing
         scraped row) with front5, dc, site_upc, csupc_raw, description, pk_sz.
       lookfor_list — list of dicts, one per distinct (front5, CsUPC,
         description) item not present anywhere in the research file:
         front5, brand, description, pk_sz, type, csupc, item_codes,
-        site_upcs, dcs, dcnames, no_buys.
+        site_upcs, dcs, dcnames, no_buys, relevance.
+      lookfor_rejected — same shape, for candidates the relevance filter
+        excluded: front5, brand, description, csupc, reason, pk_sz, dcs,
+        no_buys.
     """
     matched = {}      # row_idx -> set of No Buy values
     reviewed = {}      # row_idx -> list of contributing scraped-row dicts
@@ -828,19 +902,28 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
     qualifying_front5s = {rows[ridx]["front5"] for ridx in matched.keys()}
     lookfor = {}  # (front5, csupc, description) -> aggregated dict
 
+    rejected = {}  # (front5, csupc, description) -> rejection dict
+
     for f5 in qualifying_front5s:
         candidates = front5_index.get(f5, [])
         # Every back5 already present in the research file for this front5 —
         # regardless of match status — counts as "already on the offer."
         offer_back5s = {rows[ridx]["back5"] for ridx in candidates}
-        brand = ""
-        if brand_idx is not None and candidates:
-            brand = str(rows[candidates[0]]["values"][brand_idx] or "").strip()
 
-        # Relevance vocabulary: significant words from THIS front5's own
-        # research-file Descriptions (the vendor's real product line, ground
-        # truth). A front5 can be shared by unrelated vendors, so a Lookfor
-        # candidate must share real vocabulary, not just the search key.
+        # ALL distinct brands the research file lists under this front5 —
+        # not just the first. A research file can itself carry more than one
+        # brand under a shared manufacturer prefix.
+        brands = set()
+        if brand_idx is not None:
+            for ridx in candidates:
+                b = str(rows[ridx]["values"][brand_idx] or "").strip()
+                if b:
+                    brands.add(b)
+        brand = sorted(brands)[0] if brands else ""
+
+        # Fallback vocabulary, used only when there's no BRAND column to
+        # anchor on. Weaker (generic grocery words overlap across unrelated
+        # lines), so it is never the primary rule.
         reference_vocab = set()
         if desc_idx is not None:
             for ridx in candidates:
@@ -854,15 +937,41 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
             if site_b5 and site_b5 in offer_back5s:
                 continue  # already surfaced via Stocked or Review Queue
             description = (res.get("Description") or "").strip()
-            if not (significant_tokens(description) & reference_vocab):
-                continue  # no shared vocabulary — likely an unrelated
-                          # vendor sharing this front5, not this brand's line
+
+            # Relevance gate. Primary rule is the brand token that leads
+            # every real C&S description; vocabulary is only a fallback.
+            if brands:
+                hit = matched_brand_word(description, brands)
+                relevant = hit is not None
+                reason = (f"brand:{hit}" if relevant
+                          else f"no brand match ({'/'.join(sorted(brands))})")
+            else:
+                shared = significant_tokens(description) & reference_vocab
+                relevant = bool(shared)
+                reason = ("vocab:" + ",".join(sorted(shared)) if relevant
+                          else "no shared vocabulary (no BRAND column)")
+
+            if not relevant:
+                rkey = (f5, c5, description)
+                rej = rejected.setdefault(rkey, {
+                    "front5": f5, "brand": brand, "description": description,
+                    "csupc": c5, "reason": reason, "pk_sz": set(),
+                    "dcs": set(), "no_buys": set(),
+                })
+                if res.get("Pk/Sz"):
+                    rej["pk_sz"].add(res["Pk/Sz"])
+                if res.get("DC"):
+                    rej["dcs"].add(res["DC"])
+                if res.get("No Buy"):
+                    rej["no_buys"].add(res["No Buy"])
+                continue
+
             key = (f5, c5, description)
             entry = lookfor.setdefault(key, {
                 "front5": f5, "brand": brand, "description": description,
                 "pk_sz": set(), "type": set(), "csupc": c5,
                 "item_codes": set(), "site_upcs": set(), "dcs": set(),
-                "dcnames": set(), "no_buys": set(),
+                "dcnames": set(), "no_buys": set(), "relevance": reason,
             })
             if res.get("Pk/Sz"):
                 entry["pk_sz"].add(res["Pk/Sz"])
@@ -880,8 +989,17 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
                 entry["no_buys"].add(res["No Buy"])
 
     lookfor_list = sorted(lookfor.values(), key=lambda e: (e["front5"], e["description"]))
+    lookfor_rejected = sorted(rejected.values(),
+                              key=lambda e: (e["front5"], e["description"]))
 
-    return out, review_out, lookfor_list
+    if lookfor_rejected:
+        print(f"\n  Lookfor relevance filter: kept {len(lookfor_list)}, "
+              f"excluded {len(lookfor_rejected)} item(s) whose description "
+              "did not identify them as the front5's own brand "
+              "(a front5 can be shared by unrelated vendors).")
+        print("  Re-run with --lookfor-audit to see every excluded item and why.")
+
+    return out, review_out, lookfor_list, lookfor_rejected
 
 
 def diagnose_matching(rows, front5_index, prog):
@@ -941,7 +1059,8 @@ def diagnose_matching(rows, front5_index, prog):
         )
 
 
-def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path):
+def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
+                 lookfor_rejected=None):
     """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, a
     'Stocked Vendor Lines' tab, and a 'Lookfor' tab.
 
@@ -1029,7 +1148,7 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path):
     ws4 = wb.create_sheet("Lookfor")
     ws4.append(["Front5", "Brand", "Description", "Pk/Sz", "Type", "CsUPC",
                 "Site ItemCode(s)", "Site UPC(s)", "DC(s)", "DC Name(s)",
-                "No Buy(s)"])
+                "No Buy(s)", "Matched On"])
     for entry in lookfor_list:
         ws4.append([
             entry["front5"], entry["brand"], entry["description"],
@@ -1041,7 +1160,24 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path):
             ", ".join(sorted(entry["dcs"])),
             ", ".join(sorted(entry["dcnames"])),
             ", ".join(sorted(entry["no_buys"])),
+            entry.get("relevance", ""),
         ])
+
+    # Optional audit tab — every candidate the relevance filter excluded,
+    # with the reason. Keeps the filter verifiable instead of a black box.
+    if lookfor_rejected:
+        ws5 = wb.create_sheet("Lookfor Audit (excluded)")
+        ws5.append(["Front5", "Research Brand", "Site Description", "Pk/Sz",
+                    "CsUPC", "DC(s)", "No Buy(s)", "Excluded Because"])
+        for entry in lookfor_rejected:
+            ws5.append([
+                entry["front5"], entry["brand"], entry["description"],
+                ", ".join(sorted(entry["pk_sz"])),
+                entry["csupc"],
+                ", ".join(sorted(entry["dcs"])),
+                ", ".join(sorted(entry["no_buys"])),
+                entry["reason"],
+            ])
 
     wb.save(out_path)
     return n, len(review_map), n_vendor_lines, len(lookfor_list)
@@ -1176,6 +1312,10 @@ def main():
     ap.add_argument("--rebuild-output", action="store_true",
                     help="Skip searching; just rebuild the output from an "
                          "existing complete progress file.")
+    ap.add_argument("--lookfor-audit", action="store_true",
+                    help="Add a 'Lookfor Audit (excluded)' tab listing every "
+                         "candidate the relevance filter excluded and why — "
+                         "use it to verify nothing legitimate was dropped.")
     ap.add_argument("--diagnose", action="store_true",
                     help="No browser, no output file. Reads the saved progress "
                          "file and prints, per searched front5, the candidate "
@@ -1218,10 +1358,11 @@ def main():
         prog = load_progress(progress_path, chunks, args.input)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
-        no_buy_map, review_map, lookfor_list = match_and_report(
+        no_buy_map, review_map, lookfor_list, lookfor_rejected = match_and_report(
             rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
         n, n_review, n_vendor, n_lookfor = write_output(
-            headers, rows, no_buy_map, review_map, lookfor_list, out_path)
+            headers, rows, no_buy_map, review_map, lookfor_list, out_path,
+            lookfor_rejected=lookfor_rejected if args.lookfor_audit else None)
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
               f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
               f"Lookfor rows to {out_path}")
@@ -1296,10 +1437,11 @@ def main():
         browser.close()
 
     # ---- Match + write output (always, so partial progress is usable) ----
-    no_buy_map, review_map, lookfor_list = match_and_report(
+    no_buy_map, review_map, lookfor_list, lookfor_rejected = match_and_report(
         rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
     n, n_review, n_vendor, n_lookfor = write_output(
-        headers, rows, no_buy_map, review_map, lookfor_list, out_path)
+        headers, rows, no_buy_map, review_map, lookfor_list, out_path,
+        lookfor_rejected=lookfor_rejected if args.lookfor_audit else None)
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
           f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
           f"Lookfor rows to {out_path}")

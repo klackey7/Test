@@ -1001,6 +1001,92 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path):
     return n, len(review_map), n_vendor_lines, len(lookfor_list)
 
 
+def format_pack_size(pack, size, uos) -> str:
+    """Combine the research file's separate PACK/SIZE/UOS columns into one
+    readable field, e.g. '12/15.50 FO' — matching the site's own Pk/Sz
+    display convention. Blank pieces are dropped rather than shown as
+    'None'."""
+    pack_s = str(pack).strip() if pack not in (None, "") else ""
+    size_s = str(size).strip() if size not in (None, "") else ""
+    uos_s = str(uos).strip() if uos not in (None, "") else ""
+    left = f"{pack_s}/{size_s}" if pack_s and size_s else (pack_s or size_s)
+    return f"{left} {uos_s}".strip() if uos_s else left
+
+
+def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
+    """Write a clean, standalone, account-manager-ready summary — a
+    SEPARATE file from the internal 4-tab workbook, since the internal
+    matching/comparison tabs (Review Queue, Stocked Vendor Lines, the raw
+    'Lookfor' diagnostics) aren't meant for external sharing.
+
+    Rows: Stocked (confirmed "On Offer") + Lookfor (confirmed "Ask Source")
+    only — Review Queue items are excluded, they're still unconfirmed.
+
+    Columns: Brand, Description, Pack/Size, Your Cost, List Price,
+    % Spread, Status. Your Cost/List Price/% Spread are blank for "Ask
+    Source" rows — there's no pricing for items that were never on the
+    offer. Sorted by Brand then Description for easy scanning.
+    """
+    brand_idx = find_header_index(headers, "BRAND")
+    desc_idx = find_header_index(headers, "DESCRIPTION")
+    pack_idx = find_header_index(headers, "PACK")
+    size_idx = find_header_index(headers, "SIZE")
+    uos_idx = find_header_index(headers, "UOS")
+    cost_idx = find_header_index(headers, "YOUR COST")
+    list_idx = find_header_index(headers, "LIST PRICE")
+
+    missing = [name for name, idx in [
+        ("BRAND", brand_idx), ("DESCRIPTION", desc_idx), ("PACK", pack_idx),
+        ("SIZE", size_idx), ("YOUR COST", cost_idx), ("LIST PRICE", list_idx),
+    ] if idx is None]
+    if missing:
+        print(f"  WARNING: research file is missing column(s) {missing} — "
+              "skipping the account-manager summary file. "
+              f"Headers seen: {headers}")
+        return 0
+
+    out_rows = []  # (brand, description, pack_size, cost, list_price, spread_pct, status)
+
+    for ridx in no_buy_map.keys():
+        vals = rows[ridx]["values"]
+        cost = vals[cost_idx]
+        list_price = vals[list_idx]
+        spread_pct = None
+        try:
+            cost_f = float(cost)
+            list_f = float(list_price)
+            if list_f:
+                spread_pct = round((list_f - cost_f) / list_f * 100, 2)
+        except (TypeError, ValueError):
+            pass
+        out_rows.append((
+            vals[brand_idx], vals[desc_idx],
+            format_pack_size(vals[pack_idx], vals[size_idx],
+                              vals[uos_idx] if uos_idx is not None else ""),
+            cost, list_price, spread_pct, "On Offer",
+        ))
+
+    for entry in lookfor_list:
+        out_rows.append((
+            entry["brand"], entry["description"],
+            ", ".join(sorted(entry["pk_sz"])),
+            "", "", "", "Ask Source",
+        ))
+
+    out_rows.sort(key=lambda r: (str(r[0] or "").upper(), str(r[1] or "").upper()))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "CS Stock Summary"
+    ws.append(["Brand", "Description", "Pack/Size", "Your Cost", "List Price",
+               "% Spread", "Status"])
+    for row in out_rows:
+        ws.append(list(row))
+
+    wb.save(out_path)
+    return len(out_rows)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1015,12 +1101,20 @@ def default_progress_path(input_path):
     return f"{base}_progress.json"
 
 
+def default_share_path(input_path):
+    base, ext = os.path.splitext(input_path)
+    return f"{base}_CS_STOCK_SUMMARY{ext or '.xlsx'}"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="C&S (divert.cssourcing.com) stock-check automation.")
     ap.add_argument("--input", required=True, help="Research .xlsx file.")
     ap.add_argument("--out", default=None,
-                    help="Output workbook (default: <input>_STOCKED.xlsx).")
+                    help="Internal output workbook (default: <input>_STOCKED.xlsx).")
+    ap.add_argument("--share-out", default=None,
+                    help="Account-manager-ready summary file (default: "
+                         "<input>_CS_STOCK_SUMMARY.xlsx).")
     ap.add_argument("--progress", default=None,
                     help="Progress JSON path (default: <input>_progress.json).")
     ap.add_argument("--chunks", type=int, default=5,
@@ -1045,6 +1139,7 @@ def main():
     args = ap.parse_args()
 
     out_path = args.out or default_out_path(args.input)
+    share_path = args.share_out or default_share_path(args.input)
     progress_path = args.progress or default_progress_path(args.input)
 
     print("=" * 70)
@@ -1083,6 +1178,9 @@ def main():
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
               f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
               f"Lookfor rows to {out_path}")
+        n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
+        if n_share:
+            print(f"Wrote {n_share}-row account-manager summary to {share_path}")
         return
 
     # ---- Load / init progress ----
@@ -1158,6 +1256,9 @@ def main():
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
           f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
           f"Lookfor rows to {out_path}")
+    n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
+    if n_share:
+        print(f"Wrote {n_share}-row account-manager summary to {share_path}")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "

@@ -682,7 +682,7 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
 # Matching + output
 # ═══════════════════════════════════════════════════════════════════════════
 
-def match_and_report(rows, front5_index, prog, verbose_sample=8):
+def match_and_report(rows, front5_index, prog, brand_idx=None, verbose_sample=8):
     """Match scraped results back to research rows.
 
     For each scraped row: front5 F and CsUPC -> csupc5 C5. A research row
@@ -698,10 +698,26 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
     This is still an exact match, just against a different real field, so it
     never touches the primary (CsUPC-only) matched set — no fuzzy matching.
 
-    Returns (no_buy_map, review_map):
+    THIRD, SEPARATE pass — Lookfor: for any front5 with at least one
+    confirmed primary match (a proven vendor relationship), scan every
+    scraped row under that front5 for items whose CsUPC has NO
+    representation at all in the research file for that front5 — neither
+    as a back5 match nor a site-UPC-column-back5 match (so already-Stocked
+    and already-Review-Queued items are excluded, never double-counted).
+    These are real items C&S carries under a vendor already proven to be
+    stocked, but that never made it onto the research offer sheet at all —
+    e.g. "ITO EN shows 2 matches, but C&S actually carries 7" is exactly
+    what this surfaces. brand_idx (optional) pulls the vendor's own BRAND
+    label from any research row sharing that front5, for display only.
+
+    Returns (no_buy_map, review_map, lookfor_list):
       no_buy_map — research_row_index -> "No Buy" string (primary matches).
       review_map — research_row_index -> list of dicts (one per contributing
         scraped row) with front5, dc, site_upc, csupc_raw, description, pk_sz.
+      lookfor_list — list of dicts, one per distinct (front5, CsUPC,
+        description) item not present anywhere in the research file:
+        front5, brand, description, pk_sz, type, csupc, item_codes,
+        site_upcs, dcs, dcnames, no_buys.
     """
     matched = {}      # row_idx -> set of No Buy values
     reviewed = {}      # row_idx -> list of contributing scraped-row dicts
@@ -774,7 +790,52 @@ def match_and_report(rows, front5_index, prog, verbose_sample=8):
     review_out = {ridx: entries for ridx, entries in reviewed.items()
                   if ridx not in matched}
 
-    return out, review_out
+    # ---- Third pass: Lookfor — items C&S stocks that aren't on the offer ----
+    qualifying_front5s = {rows[ridx]["front5"] for ridx in matched.keys()}
+    lookfor = {}  # (front5, csupc, description) -> aggregated dict
+
+    for f5 in qualifying_front5s:
+        candidates = front5_index.get(f5, [])
+        # Every back5 already present in the research file for this front5 —
+        # regardless of match status — counts as "already on the offer."
+        offer_back5s = {rows[ridx]["back5"] for ridx in candidates}
+        brand = ""
+        if brand_idx is not None and candidates:
+            brand = str(rows[candidates[0]]["values"][brand_idx] or "").strip()
+
+        for res in prog["results"].get(f5, []):
+            c5 = csupc5(res.get("CsUPC", ""))
+            if not c5 or c5 in offer_back5s:
+                continue
+            site_b5 = site_upc_back5(res.get("UPC", ""))
+            if site_b5 and site_b5 in offer_back5s:
+                continue  # already surfaced via Stocked or Review Queue
+            description = (res.get("Description") or "").strip()
+            key = (f5, c5, description)
+            entry = lookfor.setdefault(key, {
+                "front5": f5, "brand": brand, "description": description,
+                "pk_sz": set(), "type": set(), "csupc": c5,
+                "item_codes": set(), "site_upcs": set(), "dcs": set(),
+                "dcnames": set(), "no_buys": set(),
+            })
+            if res.get("Pk/Sz"):
+                entry["pk_sz"].add(res["Pk/Sz"])
+            if res.get("Type"):
+                entry["type"].add(res["Type"])
+            if res.get("ItemCode"):
+                entry["item_codes"].add(str(res["ItemCode"]))
+            if res.get("UPC"):
+                entry["site_upcs"].add(res["UPC"])
+            if res.get("DC"):
+                entry["dcs"].add(res["DC"])
+            if res.get("DcName"):
+                entry["dcnames"].add(res["DcName"])
+            if res.get("No Buy"):
+                entry["no_buys"].add(res["No Buy"])
+
+    lookfor_list = sorted(lookfor.values(), key=lambda e: (e["front5"], e["description"]))
+
+    return out, review_out, lookfor_list
 
 
 def diagnose_matching(rows, front5_index, prog):
@@ -834,9 +895,9 @@ def diagnose_matching(rows, front5_index, prog):
         )
 
 
-def write_output(headers, rows, no_buy_map, review_map, out_path):
-    """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, and a
-    'Stocked Vendor Lines' tab.
+def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path):
+    """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, a
+    'Stocked Vendor Lines' tab, and a 'Lookfor' tab.
 
     Stocked: original columns + 'No Buy', matches-only, primary CsUPC-exact
     hits only — unaffected by anything in the review queue.
@@ -852,6 +913,12 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
     one item from is worth considering in full for other clients. Based on
     the confirmed Stocked tab only, not the Review Queue (still unconfirmed).
     Each row is marked whether it was itself one of the confirmed hits.
+
+    Lookfor: items C&S actually carries under a vendor already proven
+    stocked, that never made it onto the research offer sheet at all —
+    computed in match_and_report(), not from research rows (there are none
+    to pull from — that's the point). No original headers apply here; its
+    own column set is used instead.
     """
     upc_idx = find_header_index(headers, "UPC")
 
@@ -913,8 +980,25 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
                        ["Yes" if is_hit else "", no_buy_map.get(ridx, "")])
             n_vendor_lines += 1
 
+    ws4 = wb.create_sheet("Lookfor")
+    ws4.append(["Front5", "Brand", "Description", "Pk/Sz", "Type", "CsUPC",
+                "Site ItemCode(s)", "Site UPC(s)", "DC(s)", "DC Name(s)",
+                "No Buy(s)"])
+    for entry in lookfor_list:
+        ws4.append([
+            entry["front5"], entry["brand"], entry["description"],
+            ", ".join(sorted(entry["pk_sz"])),
+            ", ".join(sorted(entry["type"])),
+            entry["csupc"],
+            ", ".join(sorted(entry["item_codes"])),
+            ", ".join(sorted(entry["site_upcs"])),
+            ", ".join(sorted(entry["dcs"])),
+            ", ".join(sorted(entry["dcnames"])),
+            ", ".join(sorted(entry["no_buys"])),
+        ])
+
     wb.save(out_path)
-    return n, len(review_map), n_vendor_lines
+    return n, len(review_map), n_vendor_lines, len(lookfor_list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -977,6 +1061,7 @@ def main():
 
     chunks = chunk_list(unique_front5, args.chunks)
     print(f"  Split into {len(chunks)} chunks.")
+    brand_idx = find_header_index(headers, "BRAND")
 
     # ---- Diagnose-only path (no browser, no output file) ----
     if args.diagnose:
@@ -991,10 +1076,13 @@ def main():
         prog = load_progress(progress_path, chunks, args.input)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
-        no_buy_map, review_map = match_and_report(rows, front5_index, prog)
-        n, n_review, n_vendor = write_output(headers, rows, no_buy_map, review_map, out_path)
-        print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, and "
-              f"{n_vendor} Stocked Vendor Lines rows to {out_path}")
+        no_buy_map, review_map, lookfor_list = match_and_report(
+            rows, front5_index, prog, brand_idx=brand_idx)
+        n, n_review, n_vendor, n_lookfor = write_output(
+            headers, rows, no_buy_map, review_map, lookfor_list, out_path)
+        print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
+              f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
+              f"Lookfor rows to {out_path}")
         return
 
     # ---- Load / init progress ----
@@ -1063,10 +1151,13 @@ def main():
         browser.close()
 
     # ---- Match + write output (always, so partial progress is usable) ----
-    no_buy_map, review_map = match_and_report(rows, front5_index, prog)
-    n, n_review, n_vendor = write_output(headers, rows, no_buy_map, review_map, out_path)
-    print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, and "
-          f"{n_vendor} Stocked Vendor Lines rows to {out_path}")
+    no_buy_map, review_map, lookfor_list = match_and_report(
+        rows, front5_index, prog, brand_idx=brand_idx)
+    n, n_review, n_vendor, n_lookfor = write_output(
+        headers, rows, no_buy_map, review_map, lookfor_list, out_path)
+    print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
+          f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
+          f"Lookfor rows to {out_path}")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "

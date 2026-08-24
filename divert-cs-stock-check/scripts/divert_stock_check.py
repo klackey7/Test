@@ -900,9 +900,16 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
 
     # ---- Third pass: Lookfor — items C&S stocks that aren't on the offer ----
     qualifying_front5s = {rows[ridx]["front5"] for ridx in matched.keys()}
-    lookfor = {}  # (front5, csupc, description) -> aggregated dict
+    # Keyed by (front5, csupc) ONLY, not description — CsUPC is C&S's own
+    # item code within that front5, so it's the real identity. Confirmed
+    # 2026-08-24: the same physical item scraped from different DCs can
+    # carry cosmetic description drift (a stray leading/trailing "*", a
+    # truncated ending) that looked like duplicate rows when description
+    # was part of the key. Descriptions now aggregate under the CsUPC like
+    # every other cross-DC field (Pk/Sz, No Buy, etc).
+    lookfor = {}  # (front5, csupc) -> aggregated dict
 
-    rejected = {}  # (front5, csupc, description) -> rejection dict
+    rejected = {}  # (front5, csupc) -> rejection dict
 
     for f5 in qualifying_front5s:
         candidates = front5_index.get(f5, [])
@@ -952,12 +959,15 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
                           else "no shared vocabulary (no BRAND column)")
 
             if not relevant:
-                rkey = (f5, c5, description)
+                rkey = (f5, c5)
                 rej = rejected.setdefault(rkey, {
-                    "front5": f5, "brand": brand, "description": description,
-                    "csupc": c5, "reason": reason, "pk_sz": set(),
+                    "front5": f5, "brand": brand, "descriptions": set(),
+                    "csupc": c5, "reasons": set(), "pk_sz": set(),
                     "dcs": set(), "no_buys": set(),
                 })
+                if description:
+                    rej["descriptions"].add(description)
+                rej["reasons"].add(reason)
                 if res.get("Pk/Sz"):
                     rej["pk_sz"].add(res["Pk/Sz"])
                 if res.get("DC"):
@@ -966,13 +976,16 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
                     rej["no_buys"].add(res["No Buy"])
                 continue
 
-            key = (f5, c5, description)
+            key = (f5, c5)
             entry = lookfor.setdefault(key, {
-                "front5": f5, "brand": brand, "description": description,
+                "front5": f5, "brand": brand, "descriptions": set(),
                 "pk_sz": set(), "type": set(), "csupc": c5,
                 "item_codes": set(), "site_upcs": set(), "dcs": set(),
-                "dcnames": set(), "no_buys": set(), "relevance": reason,
+                "dcnames": set(), "no_buys": set(), "relevance": set(),
             })
+            if description:
+                entry["descriptions"].add(description)
+            entry["relevance"].add(reason)
             if res.get("Pk/Sz"):
                 entry["pk_sz"].add(res["Pk/Sz"])
             if res.get("Type"):
@@ -988,9 +1001,19 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
             if res.get("No Buy"):
                 entry["no_buys"].add(res["No Buy"])
 
-    lookfor_list = sorted(lookfor.values(), key=lambda e: (e["front5"], e["description"]))
+    # Pick one canonical description per item for display (the longest —
+    # avoids showing a truncated variant like "4P" when "4PK" was also
+    # seen), while keeping the full set available for transparency.
+    for entry in lookfor.values():
+        entry["description"] = (max(entry["descriptions"], key=len)
+                                if entry["descriptions"] else "")
+    for entry in rejected.values():
+        entry["description"] = (max(entry["descriptions"], key=len)
+                                if entry["descriptions"] else "")
+
+    lookfor_list = sorted(lookfor.values(), key=lambda e: (e["front5"], e["csupc"]))
     lookfor_rejected = sorted(rejected.values(),
-                              key=lambda e: (e["front5"], e["description"]))
+                              key=lambda e: (e["front5"], e["csupc"]))
 
     if lookfor_rejected:
         print(f"\n  Lookfor relevance filter: kept {len(lookfor_list)}, "
@@ -1146,12 +1169,13 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
             n_vendor_lines += 1
 
     ws4 = wb.create_sheet("Lookfor")
-    ws4.append(["Front5", "Brand", "Description", "Pk/Sz", "Type", "CsUPC",
-                "Site ItemCode(s)", "Site UPC(s)", "DC(s)", "DC Name(s)",
-                "No Buy(s)", "Matched On"])
+    ws4.append(["Front5", "Brand", "Description", "UPC = CsUPC", "Pk/Sz",
+                "Type", "CsUPC", "Site ItemCode(s)", "Site UPC(s) raw",
+                "DC(s)", "DC Name(s)", "No Buy(s)", "Matched On"])
     for entry in lookfor_list:
         ws4.append([
             entry["front5"], entry["brand"], entry["description"],
+            f"{entry['front5']}-{entry['csupc']}",
             ", ".join(sorted(entry["pk_sz"])),
             ", ".join(sorted(entry["type"])),
             entry["csupc"],
@@ -1160,7 +1184,7 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
             ", ".join(sorted(entry["dcs"])),
             ", ".join(sorted(entry["dcnames"])),
             ", ".join(sorted(entry["no_buys"])),
-            entry.get("relevance", ""),
+            ", ".join(sorted(entry["relevance"])),
         ])
 
     # Optional audit tab — every candidate the relevance filter excluded,
@@ -1176,7 +1200,7 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
                 entry["csupc"],
                 ", ".join(sorted(entry["dcs"])),
                 ", ".join(sorted(entry["no_buys"])),
-                entry["reason"],
+                ", ".join(sorted(entry["reasons"])),
             ])
 
     wb.save(out_path)
@@ -1211,6 +1235,7 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
     """
     brand_idx = find_header_index(headers, "BRAND")
     desc_idx = find_header_index(headers, "DESCRIPTION")
+    upc_idx = find_header_index(headers, "UPC")
     pack_idx = find_header_index(headers, "PACK")
     size_idx = find_header_index(headers, "SIZE")
     uos_idx = find_header_index(headers, "UOS")
@@ -1218,8 +1243,9 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
     list_idx = find_header_index(headers, "LIST PRICE")
 
     missing = [name for name, idx in [
-        ("BRAND", brand_idx), ("DESCRIPTION", desc_idx), ("PACK", pack_idx),
-        ("SIZE", size_idx), ("YOUR COST", cost_idx), ("LIST PRICE", list_idx),
+        ("BRAND", brand_idx), ("DESCRIPTION", desc_idx), ("UPC", upc_idx),
+        ("PACK", pack_idx), ("SIZE", size_idx), ("YOUR COST", cost_idx),
+        ("LIST PRICE", list_idx),
     ] if idx is None]
     if missing:
         print(f"  WARNING: research file is missing column(s) {missing} — "
@@ -1227,7 +1253,8 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
               f"Headers seen: {headers}")
         return 0
 
-    out_rows = []  # (brand, description, pack_size, cost, list_price, spread_pct, status)
+    # (brand, description, upc, pack_size, cost, list_price, spread_pct, status)
+    out_rows = []
 
     for ridx in no_buy_map.keys():
         vals = rows[ridx]["values"]
@@ -1241,16 +1268,22 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
                 spread_pct = round((list_f - cost_f) / list_f * 100, 2)
         except (TypeError, ValueError):
             pass
+        upc_display = format_upc_display(rows[ridx].get("pad12", ""), vals[upc_idx])
         out_rows.append((
-            vals[brand_idx], vals[desc_idx],
+            vals[brand_idx], vals[desc_idx], upc_display,
             format_pack_size(vals[pack_idx], vals[size_idx],
                               vals[uos_idx] if uos_idx is not None else ""),
             cost, list_price, spread_pct, "On Offer",
         ))
 
     for entry in lookfor_list:
+        # No research-file UPC exists for a Lookfor item (that's the point —
+        # it was never on the offer). Use the site's own front5-CsUPC pair,
+        # the same identifying number C&S itself displays, so the source
+        # has something concrete to look the item up by.
         out_rows.append((
             entry["brand"], entry["description"],
+            f"{entry['front5']}-{entry['csupc']}",
             ", ".join(sorted(entry["pk_sz"])),
             "", "", "", "Ask Source",
         ))
@@ -1260,8 +1293,8 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "CS Stock Summary"
-    ws.append(["Brand", "Description", "Pack/Size", "Your Cost", "List Price",
-               "% Spread", "Status"])
+    ws.append(["Brand", "Description", "UPC = CsUPC", "Pack/Size", "Your Cost",
+               "List Price", "% Spread", "Status"])
     for row in out_rows:
         ws.append(list(row))
 

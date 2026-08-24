@@ -182,6 +182,16 @@ def back5(val) -> str:
     return p[6:11] if len(p) == 12 else ""
 
 
+def format_upc_display(pad12_val: str, raw_val) -> str:
+    """Dashed UPC-A for readability: system-mfr5-item5-check, e.g.
+    '072310000414' -> '0-72310-00041-4'. Falls back to the original raw
+    research value (unmodified) if pad12 isn't a clean 12-digit string —
+    display-only, never used for matching."""
+    if pad12_val and len(pad12_val) == 12 and pad12_val.isdigit():
+        return f"{pad12_val[0]}-{pad12_val[1:6]}-{pad12_val[6:11]}-{pad12_val[11]}"
+    return raw_val
+
+
 def csupc5(val) -> str:
     """Site CsUPC normalized to a 5-char zero-padded string for comparison.
     CsUPC may lose leading zeros as an Excel/JS number, so we zero-pad."""
@@ -843,6 +853,17 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
     the confirmed Stocked tab only, not the Review Queue (still unconfirmed).
     Each row is marked whether it was itself one of the confirmed hits.
     """
+    upc_idx = find_header_index(headers, "UPC")
+
+    def display_values(row):
+        """Row values with the UPC cell rendered as a readable dashed UPC-A
+        (e.g. '0-72310-00041-4') instead of a raw digit string. Display-only
+        — never used for matching, and never touches the source file."""
+        vals = list(row["values"])
+        if upc_idx is not None:
+            vals[upc_idx] = format_upc_display(row.get("pad12", ""), vals[upc_idx])
+        return vals
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Stocked"
@@ -850,7 +871,7 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
 
     n = 0
     for ridx in sorted(no_buy_map.keys()):
-        ws.append(list(rows[ridx]["values"]) + [no_buy_map[ridx]])
+        ws.append(display_values(rows[ridx]) + [no_buy_map[ridx]])
         n += 1
 
     ws2 = wb.create_sheet("Review Queue")
@@ -866,7 +887,7 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
         descs = ", ".join(sorted({e["description"] for e in entries if e["description"]}))
         pksz = ", ".join(sorted({e["pk_sz"] for e in entries if e["pk_sz"]}))
         no_buys = ", ".join(sorted({e["no_buy"] for e in entries if e["no_buy"]}))
-        ws2.append(list(rows[ridx]["values"]) +
+        ws2.append(display_values(rows[ridx]) +
                    [front5s, dcs, site_upcs, csupcs, descs, pksz, no_buys])
 
     n_vendor_lines = 0
@@ -888,7 +909,7 @@ def write_output(headers, rows, no_buy_map, review_map, out_path):
             if brand not in qualifying_brands:
                 continue
             is_hit = ridx in no_buy_map
-            ws3.append(list(row["values"]) +
+            ws3.append(display_values(row) +
                        ["Yes" if is_hit else "", no_buy_map.get(ridx, "")])
             n_vendor_lines += 1
 

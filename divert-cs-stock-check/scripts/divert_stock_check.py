@@ -164,9 +164,22 @@ def front5(val) -> str:
 
 
 def back5(val) -> str:
-    """Last 5 characters of the zero-padded 12-digit UPC."""
+    """Characters at index [6:11] of the zero-padded 12-digit UPC — the item
+    code that sits between the manufacturer code (front5) and the trailing
+    GS1 check digit at index 11.
+
+    CORRECTED 2026-08-24: originally taken as the literal last 5 characters
+    (index [7:12]), which silently swaps in the check digit for the item
+    code's true last digit. Caught only because real confirmed-buy UPCs gave
+    ground truth to check against: e.g. 0-72310-00041-4 decodes to
+    system=0, mfr(front5)=72310, item=00041, check=4 — the live site's CsUPC
+    for that exact product is '00041' (index [6:11] of the padded UPC), not
+    '00414' (the old index [7:12] result). Verified against three independent
+    confirmed BIGELOW matches, all exact under this formula, all wrong under
+    the old one. front5 is unaffected — this only shifts the back5 window.
+    """
     p = pad12(val)
-    return p[-5:] if len(p) == 12 else ""
+    return p[6:11] if len(p) == 12 else ""
 
 
 def csupc5(val) -> str:
@@ -240,7 +253,7 @@ def read_research(path: str):
             "values": values,
             "pad12": p12,
             "front5": p12[1:6] if len(p12) == 12 else "",
-            "back5": p12[-5:] if len(p12) == 12 else "",
+            "back5": p12[6:11] if len(p12) == 12 else "",
         })
 
     print(f"  Read {len(rows)} data rows, skipped {blank_count} blank spacer rows.")

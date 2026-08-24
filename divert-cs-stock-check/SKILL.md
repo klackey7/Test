@@ -82,7 +82,15 @@ Notes the script handles automatically:
 1. Zero-pad every UPC to a 12-character string, left-padded with `"0"`.
 2. `front5` = characters at index `[1:6]` (0-indexed) of the padded UPC.
    Example: `850031180208` → front5 `"50031"`.
-3. `back5` = the last 5 characters of the padded 12-digit UPC.
+3. `back5` = characters at index `[6:11]` of the padded 12-digit UPC — the
+   item code sitting between the manufacturer code (front5) and the trailing
+   GS1 check digit at index 11. **Corrected 2026-08-24** — originally taken
+   as the literal last 5 characters (index `[7:12]`), which swaps the check
+   digit in for the item code's true last digit. Caught against real
+   confirmed-buy ground truth: `0-72310-00041-4` decodes to front5 `72310`,
+   item `00041`, check `4` — the live site's CsUPC for that exact product is
+   `00041` (index `[6:11]`), not `00414` (the old, wrong `[7:12]` result).
+   Verified exact against three independent confirmed BIGELOW matches.
 4. Build the set of **distinct** front5 values across all UPC rows — dedupe,
    and search **once per unique front5**, not once per row.
 

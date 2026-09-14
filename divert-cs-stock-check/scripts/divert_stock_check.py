@@ -224,6 +224,16 @@ def site_upc_back5(val) -> str:
         if tail.isdigit() and len(tail) == 5:
             return tail
     d = to_digits(val)
+    # Undashed fallbacks. HARDENED 2026-09-14: this used to return d[-5:]
+    # unconditionally, which on a full 12-digit UPC is the disproved last-5
+    # [7:12] window (check digit in place of the item code's last digit) —
+    # the very bug corrected in back5(). It mattered little while this field
+    # only fed the Review Queue; now that a site-UPC match confirms an item
+    # as stocked, it has to use the same window as back5().
+    if len(d) in (11, 12):
+        return pad12(d)[6:11]
+    if len(d) == 10:          # front5 + item code, dash simply absent
+        return d[5:10]
     return d[-5:] if len(d) >= 5 else ""
 
 
@@ -869,7 +879,7 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
-                     verbose_sample=8):
+                     verbose_sample=8, legacy_csupc_only=False):
     """Match scraped results back to research rows.
 
     For each scraped row: front5 F and CsUPC -> csupc5 C5. A research row
@@ -988,21 +998,64 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
         print("  (If CsUPC raw already shows leading zeros, no padding was needed; "
               "if it lost them, the zero-pad above recovered the match.)")
 
-    # Collapse No Buy sets to comma-joined strings (distinct, sorted).
+    # ---- Merge the two exact-match tiers into one confirmed set ----
+    # CORRECTED 2026-09-14, against real NEAR EAST ground truth.
+    #
+    # CsUPC is NOT universally the manufacturer item code. For some vendors
+    # it mirrors it (ANCIENT HARVEST, front5 89125: site UPC '89125-12000',
+    # CsUPC '12000'); for others it is C&S's own internally assigned case
+    # code with no relation to the UPC at all (NEAR EAST, front5 72251:
+    # site UPC '72251-00030', CsUPC '02044'; the CsUPCs on that vendor run
+    # 02044, 02045, 02048, 02049, 02051 ... a C&S sequence, not item codes).
+    #
+    # The site's UPC column, by contrast, is ALWAYS manufacturer prefix +
+    # item code. A back5 match against it is a full 10-digit manufacturer
+    # code match — a definitive product identification, and if anything
+    # STRONGER evidence than CsUPC, not weaker. The original design had the
+    # hierarchy backwards.
+    #
+    # Treating CsUPC as the only primary rule meant that for any
+    # NEAR-EAST-shaped vendor the script:
+    #   1. reported 0 rows in Stocked (9 real stocked items for 72251),
+    #   2. dropped every one of them from the account-manager summary,
+    #      which only ever received the CsUPC-matched set, and
+    #   3. failed to qualify the front5 for Lookfor at all, so the
+    #      "what else does C&S carry from this vendor" list came back
+    #      empty for exactly the vendors most worth asking about.
+    #
+    # Both tiers are now confirmed stocked. Which field matched is recorded
+    # in match_type so the distinction stays visible everywhere it matters.
+    review_only = set() if legacy_csupc_only else {
+        ridx for ridx in reviewed if ridx not in matched}
+
+    match_type = {ridx: "case code (CsUPC)" for ridx in matched}
+    for ridx in review_only:
+        match_type[ridx] = "item code (site UPC)"
+
     out = {}
     for ridx, vals in matched.items():
-        if vals:
-            out[ridx] = ", ".join(sorted(vals))
-        else:
-            out[ridx] = ""  # matched but No Buy blank across all DCs
+        out[ridx] = ", ".join(sorted(vals)) if vals else ""
+    for ridx in review_only:
+        vals = {str(e.get("no_buy", "")).strip() for e in reviewed[ridx]}
+        vals = {v for v in vals if v}
+        out[ridx] = ", ".join(sorted(vals)) if vals else ""
 
-    # A row that got a primary match is never also a review-queue entry,
-    # even if some other DC's row only partially agreed.
+    # Review Queue keeps the per-DC site detail for every item-code match,
+    # so they can still be eyeballed row by row. They are no longer
+    # EXCLUDED from the deliverables — only labelled.
     review_out = {ridx: entries for ridx, entries in reviewed.items()
                   if ridx not in matched}
 
+    if review_only:
+        print(f"  Confirmed {len(matched)} item(s) on case code (CsUPC) and "
+              f"{len(review_only)} on item code (site UPC column). Both are "
+              "exact matches against real site fields and both count as "
+              "stocked; --legacy-csupc-only restores the old CsUPC-only rule.")
+
     # ---- Third pass: Lookfor — items C&S stocks that aren't on the offer ----
-    qualifying_front5s = {rows[ridx]["front5"] for ridx in matched.keys()}
+    # Qualify a vendor on EITHER match tier — a front5 proven stocked only
+    # by item-code matches is just as proven as one matched on CsUPC.
+    qualifying_front5s = {rows[ridx]["front5"] for ridx in out.keys()}
     # Keyed by (front5, csupc) ONLY, not description — CsUPC is C&S's own
     # item code within that front5, so it's the real identity. Confirmed
     # 2026-08-24: the same physical item scraped from different DCs can
@@ -1125,7 +1178,7 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
               "(a front5 can be shared by unrelated vendors).")
         print("  Re-run with --lookfor-audit to see every excluded item and why.")
 
-    return out, review_out, lookfor_list, lookfor_rejected
+    return out, review_out, lookfor_list, lookfor_rejected, match_type
 
 
 def diagnose_matching(rows, front5_index, prog):
@@ -1207,7 +1260,7 @@ def helper_col_fixups(headers):
 
 def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
                  lookfor_rejected=None, run_log=None, unique_front5=None,
-                 prep_audit=None, keep_source_helpers=False):
+                 prep_audit=None, keep_source_helpers=False, match_type=None):
     """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, a
     'Stocked Vendor Lines' tab, and a 'Lookfor' tab.
 
@@ -1253,11 +1306,16 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Stocked"
-    ws.append(list(headers) + ["No Buy"])
+    # "Matched On" says which real site field confirmed the item: the case
+    # code (CsUPC) or the item code (the site's own UPC column). Both are
+    # exact matches; CsUPC is simply not the item code for every vendor.
+    mt = match_type or {}
+    ws.append(list(headers) + ["No Buy", "Matched On"])
 
     n = 0
     for ridx in sorted(no_buy_map.keys()):
-        ws.append(display_values(rows[ridx]) + [no_buy_map[ridx]])
+        ws.append(display_values(rows[ridx])
+                  + [no_buy_map[ridx], mt.get(ridx, "case code (CsUPC)")])
         n += 1
 
     ws2 = wb.create_sheet("Review Queue")
@@ -1413,14 +1471,22 @@ def format_pack_size(pack, size, uos) -> str:
     return f"{left} {uos_s}".strip() if uos_s else left
 
 
-def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
+def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path,
+                        match_type=None):
     """Write a clean, standalone, account-manager-ready summary — a
     SEPARATE file from the internal 4-tab workbook, since the internal
     matching/comparison tabs (Review Queue, Stocked Vendor Lines, the raw
     'Lookfor' diagnostics) aren't meant for external sharing.
 
-    Rows: Stocked (confirmed "On Offer") + Lookfor (confirmed "Ask Source")
-    only — Review Queue items are excluded, they're still unconfirmed.
+    Rows: Stocked (confirmed "On Offer") + Lookfor (confirmed "Ask Source").
+
+    CORRECTED 2026-09-14: item-code (site UPC column) matches used to be
+    excluded from this file entirely, because they lived only in the Review
+    Queue and this function was never passed it. That silently dropped every
+    stocked item from any vendor whose CsUPC is a C&S-assigned case code
+    rather than the manufacturer item code (NEAR EAST being the case that
+    exposed it) — exactly the items a client quote needs. Both tiers now
+    flow through, with "Matched On" naming the field that confirmed each.
 
     Columns: Brand, Description, Pack/Size, Your Cost, List Price,
     % Spread, Status. Your Cost/List Price/% Spread are blank for "Ask
@@ -1468,6 +1534,7 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
             format_pack_size(vals[pack_idx], vals[size_idx],
                               vals[uos_idx] if uos_idx is not None else ""),
             cost, list_price, spread_pct, "On Offer",
+            (match_type or {}).get(ridx, "case code (CsUPC)"),
         ))
 
     for entry in lookfor_list:
@@ -1479,7 +1546,7 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
             entry["brand"], entry["description"],
             f"{entry['front5']}-{entry['csupc']}",
             ", ".join(sorted(entry["pk_sz"])),
-            "", "", "", "Ask Source",
+            "", "", "", "Ask Source", "",
         ))
 
     out_rows.sort(key=lambda r: (str(r[0] or "").upper(), str(r[1] or "").upper()))
@@ -1488,7 +1555,7 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path):
     ws = wb.active
     ws.title = "CS Stock Summary"
     ws.append(["Brand", "Description", "UPC = CsUPC", "Pack/Size", "Your Cost",
-               "List Price", "% Spread", "Status"])
+               "List Price", "% Spread", "Status", "Matched On"])
     for row in out_rows:
         ws.append(list(row))
 
@@ -1515,7 +1582,7 @@ def _review_no_buy_is_clean_no(entries) -> bool:
 
 
 def write_final_review(headers, rows, no_buy_map, review_map, out_path,
-                       keep_source_helpers=False):
+                       keep_source_helpers=False, match_type=None):
     """Write the account-manager-ready Final Review workbook — the shape
     proven out by hand on the real Coffees & Teas run and confirmed
     2026-08-24: same columns as the research file (no added columns, since
@@ -1554,11 +1621,18 @@ def write_final_review(headers, rows, no_buy_map, review_map, out_path,
             vals[idx] = row.get(key, "")
         return vals
 
+    # Bold still means "case code (CsUPC) match", plain "item code (site UPC
+    # column) match" — the user's own vocabulary. What changed 2026-09-14 is
+    # that plain is no longer a lower CONFIDENCE tier that gets excluded from
+    # the shareable summary; it is just a different real field. Both are
+    # exact matches and both are genuinely stocked.
+    mt = match_type or {}
     included = []  # (row_idx, bold)
     for ridx in range(len(rows)):
         if ridx in no_buy_map:
             if _no_buy_is_clean_no(no_buy_map[ridx]):
-                included.append((ridx, True))
+                is_case = mt.get(ridx, "case code (CsUPC)").startswith("case")
+                included.append((ridx, is_case))
         elif ridx in review_map:
             if _review_no_buy_is_clean_no(review_map[ridx]):
                 included.append((ridx, False))
@@ -1659,6 +1733,15 @@ def main():
                          "no courtesy delay and a single chunk. Progress is "
                          "still saved every --save-every searches, so the run "
                          "stays resumable.")
+    ap.add_argument("--legacy-csupc-only", action="store_true",
+                    help="Restore the pre-2026-09-14 rule: confirm a match "
+                         "ONLY on CsUPC, and treat a site-UPC-column match as "
+                         "an unconfirmed Review Queue item excluded from the "
+                         "account-manager summary. This misses every stocked "
+                         "item from a vendor whose CsUPC is a C&S-assigned "
+                         "case code rather than the manufacturer item code "
+                         "(e.g. NEAR EAST). Provided only to reproduce an "
+                         "earlier run.")
     ap.add_argument("--keep-source-back5", action="store_true",
                     help="Carry any pre-computed UPC12/FRONT5/BACK5 helper "
                          "columns from the input through to the output "
@@ -1737,23 +1820,28 @@ def main():
         prog = load_progress(progress_path, chunks, args.input)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
-        no_buy_map, review_map, lookfor_list, lookfor_rejected = match_and_report(
-            rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
+        (no_buy_map, review_map, lookfor_list, lookfor_rejected,
+         match_type) = match_and_report(
+            rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx,
+            legacy_csupc_only=args.legacy_csupc_only)
         n, n_review, n_vendor, n_lookfor = write_output(
             headers, rows, no_buy_map, review_map, lookfor_list, out_path,
             lookfor_rejected=lookfor_rejected if args.lookfor_audit else None,
             run_log=prog.get("run_log"), unique_front5=unique_front5,
             prep_audit=prep_audit,
-            keep_source_helpers=args.keep_source_back5)
+            keep_source_helpers=args.keep_source_back5,
+            match_type=match_type)
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
               f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
               f"Lookfor rows to {out_path}")
-        n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
+        n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list,
+                                      share_path, match_type=match_type)
         if n_share:
             print(f"Wrote {n_share}-row account-manager summary to {share_path}")
         n_bold, n_plain = write_final_review(
             headers, rows, no_buy_map, review_map, final_path,
-            keep_source_helpers=args.keep_source_back5)
+            keep_source_helpers=args.keep_source_back5,
+            match_type=match_type)
         print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
               f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
         print_run_summary(prog.get("run_log"), unique_front5, n, n_review,
@@ -1829,23 +1917,28 @@ def main():
         browser.close()
 
     # ---- Match + write output (always, so partial progress is usable) ----
-    no_buy_map, review_map, lookfor_list, lookfor_rejected = match_and_report(
-        rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
+    (no_buy_map, review_map, lookfor_list, lookfor_rejected,
+     match_type) = match_and_report(
+        rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx,
+        legacy_csupc_only=args.legacy_csupc_only)
     n, n_review, n_vendor, n_lookfor = write_output(
         headers, rows, no_buy_map, review_map, lookfor_list, out_path,
         lookfor_rejected=lookfor_rejected if args.lookfor_audit else None,
         run_log=prog.get("run_log"), unique_front5=unique_front5,
         prep_audit=prep_audit,
-        keep_source_helpers=args.keep_source_back5)
+        keep_source_helpers=args.keep_source_back5,
+        match_type=match_type)
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
           f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
           f"Lookfor rows to {out_path}")
-    n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
+    n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list,
+                                  share_path, match_type=match_type)
     if n_share:
         print(f"Wrote {n_share}-row account-manager summary to {share_path}")
     n_bold, n_plain = write_final_review(
         headers, rows, no_buy_map, review_map, final_path,
-        keep_source_helpers=args.keep_source_back5)
+        keep_source_helpers=args.keep_source_back5,
+        match_type=match_type)
     print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
           f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
     if n_review:

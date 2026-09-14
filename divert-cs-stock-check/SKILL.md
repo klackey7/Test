@@ -193,6 +193,50 @@ Notes the script handles automatically:
 4. Build the set of **distinct** front5 values across all UPC rows — dedupe,
    and search **once per unique front5**, not once per row.
 
+### CsUPC is not always the item code — both tiers are confirmed
+
+**CORRECTED 2026-09-14, against real NEAR EAST ground truth. This reverses
+the confidence hierarchy the skill previously assumed.**
+
+The site exposes two identifiers per row, and `CsUPC` means different things
+for different vendors:
+
+| Vendor | Site `UPC` column | Site `CsUPC` | Relationship |
+|---|---|---|---|
+| ANCIENT HARVEST (`89125`) | `89125-12000` | `12000` | CsUPC **mirrors** the item code |
+| NEAR EAST (`72251`) | `72251-00030` | `02044` | CsUPC is a **C&S-assigned case code** |
+
+NEAR EAST's CsUPCs run `02044, 02045, 02048, 02049, 02051, 02052, 02053,
+02054, 02056` — a C&S internal sequence with no relation to the manufacturer
+UPC. The site's **UPC column, by contrast, is always manufacturer prefix +
+item code**, so a `back5` match against it is a full 10-digit manufacturer
+code match: a definitive product identification, and if anything *stronger*
+evidence than CsUPC.
+
+Treating CsUPC as the only primary rule caused three compounding failures for
+every NEAR-EAST-shaped vendor:
+
+1. **Stocked reported 0** — 9 genuinely stocked NEAR EAST items, none found.
+2. **The account-manager summary dropped them entirely** — `write_share_summary`
+   was only ever passed `no_buy_map`, never the Review Queue, so item-code
+   matches could not reach the client-facing quote document at all.
+3. **The front5 never qualified for Lookfor** — `qualifying_front5s` was built
+   from CsUPC matches only, so "what else does C&S carry from this vendor"
+   came back empty for exactly the vendors most worth asking about.
+
+**Both tiers now count as stocked.** Which field matched is recorded in a
+`Matched On` column on the Stocked tab and in the account-manager summary,
+and still drives bold/plain in Final Review — but bold/plain is now a
+*which-field* signal, not a confidence tier, and neither is excluded from any
+deliverable. `--legacy-csupc-only` restores the old behavior for reproducing
+an earlier run.
+
+Corollary worth watching: when CsUPC is a C&S case code, those 5-digit values
+share a numeric space with real manufacturer item codes, so a CsUPC-only match
+on such a vendor can be a **false positive** (a research item whose item code
+happens to equal C&S's case code for a different product). The `Matched On`
+column makes these identifiable for spot-checking.
+
 ### Matching a scraped result back to the research file
 For each scraped result row, take the site's **CsUPC**, normalize it to a
 5-character zero-padded string (`csupc5` — CsUPC may lose leading zeros as a
@@ -258,7 +302,11 @@ tab that has one — display-only, matching always runs on the raw digits.
 - **Stocked** — matches-only, primary CsUPC-exact hits, all original columns
   preserved plus one new **"No Buy"** column populated per the dedup rule
   above. This is the confirmed list; the matching rule here is never relaxed.
-- **Review Queue** — confirmed 2026-08-24: a scraped row's own **UPC** column
+- **Review Queue** — retained as the per-DC drill-down detail for item-code
+  matches (site UPC, DC list, CsUPC seen, descriptions, No Buy). **Since
+  2026-09-14 these rows are ALSO in Stocked and in the account-manager
+  summary** — this tab is now a spot-check aid, not a holding pen for
+  excluded items. Original rationale, confirmed 2026-08-24: a scraped row's own **UPC** column
   back5 can genuinely disagree with that same row's **CsUPC** (e.g. UPC
   `50003-79769` but CsUPC `79774`). A research row whose back5 matches the
   site UPC column but never got a primary CsUPC hit on any scraped row would
@@ -462,6 +510,10 @@ python scripts/divert_stock_check.py --input RESEARCH.xlsx --rebuild-output
   remains.
 - Every output row traces to exactly one input row, and the input file is
   byte-identical after the run.
+- A vendor whose CsUPC is a C&S-assigned case code rather than the
+  manufacturer item code (NEAR EAST, front5 `72251`) still reports its
+  stocked items in Stocked, in the account-manager summary, and qualifies
+  for Lookfor. Regression: `72251` must yield 9 stocked items, not 0.
 
 ## Script
 

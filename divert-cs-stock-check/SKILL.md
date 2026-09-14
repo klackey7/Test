@@ -284,6 +284,35 @@ worse than a miss.
    searches (default 25) *within* a chunk, so `--chunks 1` / `--full-speed`
    stays resumable rather than risking the whole run on one save point.
 
+## Bold/plain in Final Review: every row is bold now
+
+**CORRECTED 2026-09-14, at the user's explicit direction — superseding the
+same-day "bold = case code, plain = item code" mapping.** Confirmed via a
+real example (PASTA PINCHETTI, front5 `81475`: 14 research items, 11
+matched, 3 never appeared in the search results at all) and two direct
+questions:
+
+1. The user's own rule for bold vs. plain: **bold = "populates on the
+   Product List"** (was actually matched — either tier); **plain = "brand
+   is proven stocked, but this exact item never appeared in a search
+   result."** That's a different axis than which site field matched.
+2. Asked whether unconfirmed vendor-line items (the "plain" case above)
+   should be pulled into Final Review to use that distinction — the user
+   said **no, keep Final Review matches-only**; that stays the separate
+   Stocked Vendor Lines tab's job.
+
+Combining both answers: since Final Review stays matches-only, every row
+that remains in scope was, by definition, scraped from a real Product List
+response — there is no "plain" case left inside Final Review at all.
+**Every included row renders bold now.** The case-code-vs-item-code
+distinction didn't disappear — it's still on the Stocked tab's "Matched
+On" column — it just no longer drives Final Review's font weight, since it
+was never the axis the user was actually asking about.
+
+Regression: `write_final_review` returns `(n_bold, n_plain)` for backward
+compatibility, but `n_plain` is always `0` — every included row sets
+`bold=True` regardless of `match_type`.
+
 ## Final Review inclusion: "No" at ANY matching DC confirms sellable
 
 **CORRECTED 2026-09-14, at the user's explicit direction.** The original

@@ -1661,13 +1661,25 @@ def write_final_review(headers, rows, no_buy_map, review_map, out_path,
     blank row between brand groups, one bold/plain visual marker in place
     of a Status column.
 
-    Confirmed mapping of the user's own terms onto this skill's two exact
-    match tiers:
+    CORRECTED 2026-09-14, at the user's explicit direction, superseding the
+    earlier same-day "bold = case code, plain = item code" mapping below.
+    The user's own rule: bold = "populates on the Product List" (i.e. was
+    actually matched — either tier, doesn't matter which field proved it);
+    plain = "brand is proven stocked, but this exact item never appeared in
+    a search result." Since Final Review stays MATCHES-ONLY (the user
+    explicitly declined to widen it to the full vendor line — that stays on
+    the separate Stocked Vendor Lines tab), every row that remains in scope
+    here was, by definition, scraped from a real Product List response.
+    There is therefore no "plain" case left to render: every included row
+    is bold. bold/plain no longer carries a which-field or confidence
+    signal at all — that distinction still lives in the Stocked tab's
+    "Matched On" column for anyone who wants it.
+
+    Prior (superseded 2026-09-14) mapping, kept for history:
       - "case code" match (definite)  -> the primary Stocked match, CsUPC
-        exact (back5 == CsUPC). Rendered BOLD.
+        exact (back5 == CsUPC). Was rendered BOLD.
       - "item code" match (secondary) -> the Review Queue match, site UPC
-        column back5 only. Rendered PLAIN — the user still eyeballs these
-        for discrepancies before sending, exactly as they already do.
+        column back5 only. Was rendered PLAIN.
 
     Both tiers are filtered to rows where No Buy is unambiguously "No"
     (see _no_buy_is_clean_no) — a row with a Yes/No discrepancy across DCs,
@@ -1691,21 +1703,21 @@ def write_final_review(headers, rows, no_buy_map, review_map, out_path,
             vals[idx] = row.get(key, "")
         return vals
 
-    # Bold still means "case code (CsUPC) match", plain "item code (site UPC
-    # column) match" — the user's own vocabulary. What changed 2026-09-14 is
-    # that plain is no longer a lower CONFIDENCE tier that gets excluded from
-    # the shareable summary; it is just a different real field. Both are
-    # exact matches and both are genuinely stocked.
-    mt = match_type or {}
-    included = []  # (row_idx, bold)
+    # CORRECTED 2026-09-14: every row remaining in Final Review (matches-
+    # only, per the user's explicit choice) was scraped from a real Product
+    # List response regardless of tier — bold now means exactly that, so
+    # every included row is bold. match_type / "Matched On" (still on the
+    # Stocked tab) is the place to see which field actually matched.
+    included = []  # (row_idx, bold) — bold is always True now; kept as a
+                   # tuple for the render loop below, which still branches
+                   # on it.
     for ridx in range(len(rows)):
         if ridx in no_buy_map:
             if _no_buy_is_clean_no(no_buy_map[ridx], strict=strict_no_buy):
-                is_case = mt.get(ridx, "case code (CsUPC)").startswith("case")
-                included.append((ridx, is_case))
+                included.append((ridx, True))
         elif ridx in review_map:
             if _review_no_buy_is_clean_no(review_map[ridx], strict=strict_no_buy):
-                included.append((ridx, False))
+                included.append((ridx, True))
 
     if brand_idx is None:
         print("  WARNING: no 'BRAND' column found — Final Review rows will "
@@ -1921,8 +1933,10 @@ def main():
             headers, rows, no_buy_map, review_map, final_path,
             keep_source_helpers=args.keep_source_back5,
             match_type=match_type, strict_no_buy=args.strict_no_buy)
-        print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
-              f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
+        print(f"Wrote Final Review to {final_path}: {n_bold + n_plain} row(s) "
+              "(every row bold — all populate on the Product List; "
+              "'Matched On' on the Stocked tab still shows which field "
+              "proved each one).")
         print_run_summary(prog.get("run_log"), unique_front5, n, n_review,
                           finished=None)
         return
@@ -2018,8 +2032,10 @@ def main():
         headers, rows, no_buy_map, review_map, final_path,
         keep_source_helpers=args.keep_source_back5,
         match_type=match_type, strict_no_buy=args.strict_no_buy)
-    print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
-          f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
+    print(f"Wrote Final Review to {final_path}: {n_bold + n_plain} row(s) "
+          "(every row bold — all populate on the Product List; "
+          "'Matched On' on the Stocked tab still shows which field "
+          "proved each one).")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "

@@ -134,6 +134,35 @@ specific to this one site. Keep it that way.
 ## Input file schema
 
 `Coffees_and_Teas_Brands_-_RESEARCH.xlsx` and future files in the same shape.
+Column *order and set* vary between files — everything is located by header
+name, never by position. The Pastas and Grains file (2026-09-14), for
+example, has `SIZE, PACK, UOS` where Coffees & Teas had `SIZE, UOS, PACK`,
+has no `CATEGORY 1` column at all, and appends three pre-computed helper
+columns (see below). None of that required a code change.
+
+### Pre-computed helper columns — audited, never trusted
+
+**Added 2026-09-14.** A "SEARCH PREP" input may arrive with `UPC12`,
+`FRONT5`, and `BACK5` already computed upstream. The script **never reads
+these for matching** — front5 and back5 are always recomputed from the raw
+UPC via the confirmed rule below — but it does audit them and print a
+warning when they disagree.
+
+This is not hypothetical. The Pastas and Grains SEARCH PREP file shipped a
+`BACK5` column computed as the **literal last 5 digits** (`[7:12]`) on all
+1,834 rows — exactly the formula disproved against confirmed-buy ground
+truth on 2026-08-24. Matching against it would have returned **zero hits
+across all 228 searches**, and the failure would have looked like "C&S
+doesn't stock this line" rather than a bad column. The audit turns a silent
+total-miss into a loud warning on the first line of output, and it is
+reproduced in the Run Log tab.
+
+Because the deliverable preserves the input's column order, those helper
+columns are carried into the output — but **refreshed from the confirmed
+derivation**, since shipping a known-wrong `BACK5` into an account-manager
+document is worse than shipping one that differs from the input. Pass
+`--keep-source-back5` to carry the originals through untouched. The input
+file itself is never modified either way.
 Columns (order preserved in output):
 
 > UPC, BRAND, DESCRIPTION, SIZE, UOS, PACK, SHELF, LIST PRICE, YOUR COST,
@@ -190,14 +219,26 @@ worse than a miss.
      (the default), click **Search**.
    - Scrape the **Product List** table: DC, DcName, ItemCode, UPC, CsUPC,
      Description, Pk/Sz, Type, QC Days, No Buy.
-   - Zero rows → skip silently (no output, no log for that front5).
+   - Every front5 is recorded in the **Run Log** with an explicit status —
+     `hit`, `zero`, or `error`. **Revised 2026-09-14:** zero-result searches
+     were previously skipped silently, which made "the site has nothing"
+     and "the request failed" indistinguishable in the record. They are now
+     separate statuses, and the run reconciles to the full front5 count.
+   - A search that raises is retried with exponential backoff (2s, 4s) up to
+     `--max-retries` (default 3) before being logged as an error. Errored
+     front5 values are re-attempted automatically on the next resume run.
 3. Add a **randomized 1–3 second delay** between searches (rate-limit
-   courtesy).
+   courtesy). Tunable with `--delay-min` / `--delay-max`; `--full-speed`
+   (= `--delay-min 0 --delay-max 0 --chunks 1`) runs with no courtesy delay
+   for a time-boxed run. The backoff on a *failed* request always applies,
+   so a real rate limit is absorbed and logged rather than hammered.
 4. Split the unique front5 values into **5 roughly-equal chunks**, processed
    sequentially. **Save progress to disk after each chunk** so the run is
    resumable if the browser session times out or the script crashes partway.
    On restart the script detects the progress file and resumes from the next
-   unprocessed chunk.
+   unprocessed chunk. Progress is additionally saved every `--save-every`
+   searches (default 25) *within* a chunk, so `--chunks 1` / `--full-speed`
+   stays resumable rather than risking the whole run on one save point.
 
 ## Dedup across DCs
 
@@ -232,6 +273,13 @@ tab that has one — display-only, matching always runs on the raw digits.
   from is worth considering in full for other clients. Based on the Stocked
   tab only, not the Review Queue (still unconfirmed). Each row marked
   **"Confirmed Stocked"** Yes/blank plus its **No Buy** value where applicable.
+- **Run Log** — added 2026-09-14: one row per front5 in the search list with
+  its status (`hit` / `zero` / `error` / `not attempted`), result-row count,
+  attempt count, and error text, ordered errors-first. Topped with a
+  reconciliation block that must sum to the full front5 count, plus the
+  helper-column audit. The end-of-run console summary prints the same
+  tally and **refuses to report a clean run while any front5 errored or was
+  never attempted**.
 - **Lookfor** — requested 2026-08-24: for any front5 with at least one
   confirmed Stocked match (a proven vendor relationship), items C&S actually
   carries under that front5 with **no representation at all** in the research
@@ -383,6 +431,14 @@ next unprocessed chunk — already-searched front5 values are not re-searched,
 and no duplicate output rows are produced. When all chunks are done it writes
 the final matches-only workbook.
 
+### Full-speed variant
+For a time-boxed run where the courtesy delay isn't wanted:
+```
+python scripts/divert_stock_check.py --input RESEARCH.xlsx --full-speed
+```
+Still resumable (progress saves every 25 searches), still backs off and logs
+on a failed request. Do the `--inspect` and validation steps first regardless.
+
 ### Rebuild output without searching
 If searching is complete but you want to regenerate the workbook:
 ```
@@ -399,6 +455,13 @@ python scripts/divert_stock_check.py --input RESEARCH.xlsx --rebuild-output
   values or producing duplicate output rows.
 - No guessed selectors or invented business logic anywhere. If the live DOM
   doesn't match what's assumed, the script stops and you ask the user.
+- Every front5 in the search list is accounted for in the Run Log as
+  `hit`, `zero`, `error`, or `not attempted`, and the tally reconciles to
+  the full count. A zero-result and a failed request are never conflated.
+- The run does not claim success while any error or unattempted front5
+  remains.
+- Every output row traces to exactly one input row, and the input file is
+  byte-identical after the run.
 
 ## Script
 

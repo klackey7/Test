@@ -340,6 +340,16 @@ def read_research(path: str):
       rows     — list of dicts: {"values": [...], "front5": s, "back5": s}
                  for every non-blank data row (values aligned to headers)
       upc_idx  — index of the UPC column within headers
+      prep_audit — dict describing any pre-computed UPC12/FRONT5/BACK5
+                 helper columns found in the file and whether they agree
+                 with this script's own confirmed derivation
+
+    A "SEARCH PREP" file may ship with UPC12/FRONT5/BACK5 already computed
+    upstream. Those columns are NEVER used for matching — front5/back5 are
+    always recomputed here from the raw UPC via the confirmed rule — but
+    they ARE audited, because a helper column computed with the old,
+    pre-2026-08-24 last-5 formula is a silent trap for anyone reading the
+    sheet by eye.
     """
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -379,7 +389,42 @@ def read_research(path: str):
         })
 
     print(f"  Read {len(rows)} data rows, skipped {blank_count} blank spacer rows.")
-    return headers, rows, upc_idx
+
+    # ---- Audit pre-computed helper columns (never used for matching) ----
+    prep_audit = {}
+    for col, key in (("UPC12", "pad12"), ("FRONT5", "front5"), ("BACK5", "back5")):
+        idx = find_header_index(headers, col)
+        if idx is None:
+            continue
+        width = 12 if key == "pad12" else 5
+        disagree = 0
+        example = None
+        for r in rows:
+            got = str(r["values"][idx]).strip() if r["values"][idx] is not None else ""
+            got = got.split(".")[0].zfill(width) if got else ""
+            if got != r[key]:
+                disagree += 1
+                if example is None:
+                    example = (r["pad12"], got, r[key])
+        prep_audit[col] = {"rows": len(rows), "disagree": disagree, "example": example}
+        if disagree:
+            legacy = sum(1 for r in rows
+                         if (str(r["values"][idx]).strip().split(".")[0].zfill(width)
+                             if r["values"][idx] is not None else "") == r["pad12"][7:12])
+            print(f"  !! WARNING: the file's '{col}' column disagrees with the "
+                  f"confirmed derivation on {disagree}/{len(rows)} rows.")
+            if example:
+                print(f"     e.g. UPC {example[0]}: file={example[1]!r} "
+                      f"confirmed={example[2]!r}")
+            if col == "BACK5" and legacy == len(rows):
+                print("     Every row matches the OLD last-5 [7:12] formula, which "
+                      "swaps the GS1 check digit in for the item code's last digit.")
+                print("     That formula was disproved against real confirmed-buy "
+                      "ground truth on 2026-08-24. This script IGNORES the column "
+                      "and recomputes back5 as [6:11]; matching is unaffected.")
+            prep_audit[col]["all_legacy_last5"] = (legacy == len(rows))
+
+    return headers, rows, upc_idx, prep_audit
 
 
 def build_front5_index(rows):
@@ -713,11 +758,25 @@ def scrape_results(page):
 
 
 def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
-                 stop_after):
+                 stop_after, delay_min=1.0, delay_max=3.0, save_every=25,
+                 max_retries=3):
     """Run the search loop over the remaining chunks, saving progress after
-    each chunk. Mutates prog in place."""
+    each chunk and every `save_every` searches within a chunk.
+
+    Every front5 attempted is accounted for in prog["run_log"] with an
+    explicit status — "hit", "zero", or "error". A silent zero-result and a
+    failed request must never look the same, so a search that raises is
+    retried with exponential backoff and, if it still fails, recorded as an
+    error rather than being allowed to masquerade as a zero-result.
+
+    delay_min/delay_max of 0 run at full speed with no courtesy delay; the
+    backoff on a failed request still applies, so a real rate limit is
+    absorbed and logged rather than hammered.
+    """
     total_chunks = len(prog["chunks"])
     processed_this_run = 0
+    since_save = 0
+    run_log = prog.setdefault("run_log", {})
 
     for local_i, chunk in enumerate(remaining_chunks):
         chunk_idx = chunk_offset + local_i
@@ -725,39 +784,76 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
               f"({len(chunk)} front5 values) ---")
 
         for f5 in chunk:
-            if f5 in prog["searched_front5"]:
-                continue  # already done (e.g. mid-chunk crash last time)
+            # Already done, unless it previously errored — errors are retried
+            # on resume so a run can actually reconcile to zero errors.
+            if (f5 in prog["searched_front5"]
+                    and run_log.get(f5, {}).get("status") != "error"):
+                continue
 
-            # a. enter front5, leave DC = All DC (default), click Search
-            page.fill(SELECTORS["upc_input"], f5)
-            if SELECTORS.get("dc_dropdown"):
+            results = None
+            last_err = None
+            attempts = 0
+            for attempt in range(max_retries):
+                attempts = attempt + 1
                 try:
-                    page.select_option(SELECTORS["dc_dropdown"], label=DC_VALUE)
-                except Exception:
-                    pass  # default is already All DC; not fatal
-            page.click(SELECTORS["search_button"])
-            # Let results render. networkidle is best-effort; fall back to a
-            # short settle if the site keeps a long-poll open.
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                page.wait_for_timeout(1500)
+                    page.fill(SELECTORS["upc_input"], f5)
+                    if SELECTORS.get("dc_dropdown"):
+                        try:
+                            page.select_option(SELECTORS["dc_dropdown"],
+                                               label=DC_VALUE)
+                        except Exception:
+                            pass  # default is already All DC; not fatal
+                    page.click(SELECTORS["search_button"])
+                    # Let results render. networkidle is best-effort; fall
+                    # back to a short settle if the site keeps a poll open.
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        page.wait_for_timeout(1500)
+                    results = scrape_results(page)
+                    last_err = None
+                    break
+                except SystemExit:
+                    # A header-mapping hard-stop is a "never guess" stop.
+                    # It must propagate, not be retried into a logged error.
+                    raise
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    if attempt < max_retries - 1:
+                        backoff = 2.0 * (2 ** attempt)
+                        print(f"    {f5}: request failed ({last_err}) — backing "
+                              f"off {backoff:.0f}s, retry {attempt + 2}/"
+                              f"{max_retries}")
+                        time.sleep(backoff)
 
-            # b. scrape the Product List table
-            results = scrape_results(page)
-            prog["results"][f5] = results
-            prog["searched_front5"].append(f5)
-            if results:
-                print(f"    {f5}: {len(results)} result rows")
-            # c. zero rows -> skip silently (no log line)
+            if last_err is not None:
+                run_log[f5] = {"status": "error", "rows": 0,
+                               "attempts": attempts, "error": last_err}
+                print(f"    {f5}: ERROR after {attempts} attempt(s) — {last_err}")
+            else:
+                prog["results"][f5] = results
+                run_log[f5] = {"status": "hit" if results else "zero",
+                               "rows": len(results), "attempts": attempts,
+                               "error": ""}
+                print(f"    {f5}: {len(results)} result rows"
+                      if results else f"    {f5}: 0 results (zero-result)")
 
-            # 3. randomized 1-3s courtesy delay between searches
-            time.sleep(random.uniform(1.0, 3.0))
+            if f5 not in prog["searched_front5"]:
+                prog["searched_front5"].append(f5)
 
-        # 4. save progress after EACH chunk
+            since_save += 1
+            if save_every and since_save >= save_every:
+                save_progress(progress_path, prog)
+                since_save = 0
+
+            if delay_max > 0:
+                time.sleep(random.uniform(delay_min, delay_max))
+
+        # save progress after EACH chunk
         if chunk_idx not in prog["completed_chunks"]:
             prog["completed_chunks"].append(chunk_idx)
         save_progress(progress_path, prog)
+        since_save = 0
         print(f"  Chunk {chunk_idx + 1} complete — progress saved.")
 
         processed_this_run += 1
@@ -1089,8 +1185,29 @@ def diagnose_matching(rows, front5_index, prog):
         )
 
 
+def helper_col_fixups(headers):
+    """Indices of any pre-computed UPC12/FRONT5/BACK5 helper columns, mapped
+    to the row key holding this script's own confirmed value.
+
+    These columns are carried through to the output because the deliverable
+    preserves the input's column order — but a BACK5 computed with the old
+    last-5 formula is wrong, and shipping a known-wrong number into an
+    account-manager document is worse than shipping one that differs from
+    the input. Output tabs therefore show the confirmed derivation. The raw
+    input file is never modified. Pass keep_source_helpers=True (CLI:
+    --keep-source-back5) to carry the original values through untouched.
+    """
+    out = {}
+    for col, key in (("UPC12", "pad12"), ("FRONT5", "front5"), ("BACK5", "back5")):
+        idx = find_header_index(headers, col)
+        if idx is not None:
+            out[idx] = key
+    return out
+
+
 def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
-                 lookfor_rejected=None):
+                 lookfor_rejected=None, run_log=None, unique_front5=None,
+                 prep_audit=None, keep_source_helpers=False):
     """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, a
     'Stocked Vendor Lines' tab, and a 'Lookfor' tab.
 
@@ -1116,14 +1233,21 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
     own column set is used instead.
     """
     upc_idx = find_header_index(headers, "UPC")
+    fixups = {} if keep_source_helpers else helper_col_fixups(headers)
 
     def display_values(row):
         """Row values with the UPC cell rendered as a readable dashed UPC-A
         (e.g. '0-72310-00041-4') instead of a raw digit string. Display-only
-        — never used for matching, and never touches the source file."""
+        — never used for matching, and never touches the source file.
+
+        Any pre-computed UPC12/FRONT5/BACK5 helper column is also refreshed
+        from this script's own confirmed derivation, so the output never
+        carries a stale last-5 BACK5 forward."""
         vals = list(row["values"])
         if upc_idx is not None:
             vals[upc_idx] = format_upc_display(row.get("pad12", ""), vals[upc_idx])
+        for idx, key in fixups.items():
+            vals[idx] = row.get(key, "")
         return vals
 
     wb = openpyxl.Workbook()
@@ -1210,8 +1334,71 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
                 ", ".join(sorted(entry["reasons"])),
             ])
 
+    # Run Log — every front5 accounted for, with hit / zero-result / error
+    # kept distinguishable. A search that returned nothing and a search that
+    # failed must never be indistinguishable in the record.
+    if unique_front5 is not None:
+        write_run_log_tab(wb, run_log or {}, unique_front5, prep_audit)
+
     wb.save(out_path)
     return n, len(review_map), n_vendor_lines, len(lookfor_list)
+
+
+def run_log_tally(run_log, unique_front5):
+    """Reconcile the run log against the full front5 search list.
+
+    Returns (tally, per_front5) where tally counts hit / zero / error /
+    not-attempted and sums to len(unique_front5) by construction."""
+    tally = {"hit": 0, "zero": 0, "error": 0, "not attempted": 0}
+    per = []
+    for f5 in unique_front5:
+        entry = (run_log or {}).get(f5)
+        status = entry.get("status") if entry else "not attempted"
+        if status not in tally:
+            status = "not attempted"
+        tally[status] += 1
+        per.append((f5, status, entry or {}))
+    return tally, per
+
+
+def write_run_log_tab(wb, run_log, unique_front5, prep_audit=None):
+    """One row per front5 in the search list, plus a reconciliation block.
+
+    Ordered errors first, then zero-results, then hits, so the things that
+    need attention are at the top instead of buried in 200+ successful rows.
+    """
+    ws = wb.create_sheet("Run Log")
+    tally, per = run_log_tally(run_log, unique_front5)
+
+    ws.append(["RECONCILIATION"])
+    ws["A1"].font = Font(bold=True)
+    for label in ("hit", "zero", "error", "not attempted"):
+        ws.append([label, tally[label]])
+    ws.append(["TOTAL", sum(tally.values())])
+    ws.append(["FRONT5 values in search list", len(unique_front5)])
+    ws.append([])
+
+    if prep_audit:
+        ws.append(["INPUT FILE HELPER-COLUMN AUDIT"])
+        ws.cell(ws.max_row, 1).font = Font(bold=True)
+        ws.append(["Column", "Rows", "Disagree with confirmed rule", "Note"])
+        for col, info in prep_audit.items():
+            note = ""
+            if info["disagree"] and info.get("all_legacy_last5"):
+                note = ("Uses the disproved last-5 [7:12] formula; ignored — "
+                        "back5 recomputed as [6:11] for all matching.")
+            elif info["disagree"]:
+                note = "Disagrees with the confirmed rule; ignored for matching."
+            ws.append([col, info["rows"], info["disagree"], note])
+        ws.append([])
+
+    ws.append(["FRONT5", "Status", "Result Rows", "Attempts", "Error"])
+    ws.cell(ws.max_row, 1).font = Font(bold=True)
+    order = {"error": 0, "not attempted": 1, "zero": 2, "hit": 3}
+    for f5, status, entry in sorted(per, key=lambda t: (order[t[1]], t[0])):
+        ws.append([f5, status, entry.get("rows", 0),
+                   entry.get("attempts", 0), entry.get("error", "")])
+    return tally
 
 
 def format_pack_size(pack, size, uos) -> str:
@@ -1327,7 +1514,8 @@ def _review_no_buy_is_clean_no(entries) -> bool:
     return vals == {"no"}
 
 
-def write_final_review(headers, rows, no_buy_map, review_map, out_path):
+def write_final_review(headers, rows, no_buy_map, review_map, out_path,
+                       keep_source_helpers=False):
     """Write the account-manager-ready Final Review workbook — the shape
     proven out by hand on the real Coffees & Teas run and confirmed
     2026-08-24: same columns as the research file (no added columns, since
@@ -1356,11 +1544,14 @@ def write_final_review(headers, rows, no_buy_map, review_map, out_path):
     brand_idx = find_header_index(headers, "BRAND")
     desc_idx = find_header_index(headers, "DESCRIPTION")
     upc_idx = find_header_index(headers, "UPC")
+    fixups = {} if keep_source_helpers else helper_col_fixups(headers)
 
     def display_values(row):
         vals = list(row["values"])
         if upc_idx is not None:
             vals[upc_idx] = format_upc_display(row.get("pad12", ""), vals[upc_idx])
+        for idx, key in fixups.items():
+            vals[idx] = row.get(key, "")
         return vals
 
     included = []  # (row_idx, bold)
@@ -1456,6 +1647,31 @@ def main():
                     help="Progress JSON path (default: <input>_progress.json).")
     ap.add_argument("--chunks", type=int, default=5,
                     help="Number of chunks to split front5 values into (default 5).")
+    ap.add_argument("--delay-min", type=float, default=1.0,
+                    help="Minimum courtesy delay between searches, seconds "
+                         "(default 1.0). Use 0 with --delay-max 0 for full speed.")
+    ap.add_argument("--delay-max", type=float, default=3.0,
+                    help="Maximum courtesy delay between searches, seconds "
+                         "(default 3.0). Set to 0 to disable the delay entirely; "
+                         "backoff on a failed request still applies.")
+    ap.add_argument("--full-speed", action="store_true",
+                    help="Shorthand for --delay-min 0 --delay-max 0 --chunks 1: "
+                         "no courtesy delay and a single chunk. Progress is "
+                         "still saved every --save-every searches, so the run "
+                         "stays resumable.")
+    ap.add_argument("--keep-source-back5", action="store_true",
+                    help="Carry any pre-computed UPC12/FRONT5/BACK5 helper "
+                         "columns from the input through to the output "
+                         "unchanged. Default is to refresh them from this "
+                         "script's own confirmed derivation, so a stale "
+                         "last-5 BACK5 is not shipped onward. Matching never "
+                         "reads these columns either way.")
+    ap.add_argument("--save-every", type=int, default=25,
+                    help="Save progress every N searches within a chunk "
+                         "(default 25). 0 = only save at chunk boundaries.")
+    ap.add_argument("--max-retries", type=int, default=3,
+                    help="Attempts per front5 before it is logged as an error "
+                         "(default 3), with 2s/4s exponential backoff between.")
     ap.add_argument("--stop-after-chunk", type=int, default=0,
                     help="Stop after N chunks this run (0 = run to completion). "
                          "Use 1 to validate the first chunk, then re-run to resume.")
@@ -1479,6 +1695,11 @@ def main():
                          "instead of guessed at.")
     args = ap.parse_args()
 
+    if args.full_speed:
+        args.delay_min = 0.0
+        args.delay_max = 0.0
+        args.chunks = 1
+
     out_path = args.out or default_out_path(args.input)
     share_path = args.share_out or default_share_path(args.input)
     final_path = args.final_out or default_final_review_path(args.input)
@@ -1490,14 +1711,16 @@ def main():
 
     # ---- Read research file, build front5 chunks ----
     print("\nReading research file...")
-    headers, rows, _ = read_research(args.input)
+    headers, rows, _, prep_audit = read_research(args.input)
     front5_index = build_front5_index(rows)
     unique_front5 = sorted(front5_index.keys())
     print(f"  {len(unique_front5)} distinct front5 values across "
           f"{len(rows)} research rows.")
 
     chunks = chunk_list(unique_front5, args.chunks)
-    print(f"  Split into {len(chunks)} chunks.")
+    print(f"  Split into {len(chunks)} chunk(s); courtesy delay "
+          f"{args.delay_min:.1f}-{args.delay_max:.1f}s"
+          f"{' (full speed)' if args.delay_max <= 0 else ''}.")
     brand_idx = find_header_index(headers, "BRAND")
     desc_idx = find_header_index(headers, "DESCRIPTION")
 
@@ -1518,16 +1741,23 @@ def main():
             rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
         n, n_review, n_vendor, n_lookfor = write_output(
             headers, rows, no_buy_map, review_map, lookfor_list, out_path,
-            lookfor_rejected=lookfor_rejected if args.lookfor_audit else None)
+            lookfor_rejected=lookfor_rejected if args.lookfor_audit else None,
+            run_log=prog.get("run_log"), unique_front5=unique_front5,
+            prep_audit=prep_audit,
+            keep_source_helpers=args.keep_source_back5)
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
               f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
               f"Lookfor rows to {out_path}")
         n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
         if n_share:
             print(f"Wrote {n_share}-row account-manager summary to {share_path}")
-        n_bold, n_plain = write_final_review(headers, rows, no_buy_map, review_map, final_path)
+        n_bold, n_plain = write_final_review(
+            headers, rows, no_buy_map, review_map, final_path,
+            keep_source_helpers=args.keep_source_back5)
         print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
               f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
+        print_run_summary(prog.get("run_log"), unique_front5, n, n_review,
+                          finished=None)
         return
 
     # ---- Load / init progress ----
@@ -1540,6 +1770,7 @@ def main():
             "completed_chunks": [],
             "searched_front5": [],
             "results": {},
+            "run_log": {},
         }
 
     # ---- Browser session ----
@@ -1591,7 +1822,9 @@ def main():
         else:
             finished = run_searches(
                 page, remaining, chunk_offset, prog, progress_path,
-                args.stop_after_chunk)
+                args.stop_after_chunk, delay_min=args.delay_min,
+                delay_max=args.delay_max, save_every=args.save_every,
+                max_retries=args.max_retries)
 
         browser.close()
 
@@ -1600,24 +1833,58 @@ def main():
         rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx)
     n, n_review, n_vendor, n_lookfor = write_output(
         headers, rows, no_buy_map, review_map, lookfor_list, out_path,
-        lookfor_rejected=lookfor_rejected if args.lookfor_audit else None)
+        lookfor_rejected=lookfor_rejected if args.lookfor_audit else None,
+        run_log=prog.get("run_log"), unique_front5=unique_front5,
+        prep_audit=prep_audit,
+        keep_source_helpers=args.keep_source_back5)
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
           f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
           f"Lookfor rows to {out_path}")
     n_share = write_share_summary(headers, rows, no_buy_map, lookfor_list, share_path)
     if n_share:
         print(f"Wrote {n_share}-row account-manager summary to {share_path}")
-    n_bold, n_plain = write_final_review(headers, rows, no_buy_map, review_map, final_path)
+    n_bold, n_plain = write_final_review(
+        headers, rows, no_buy_map, review_map, final_path,
+        keep_source_helpers=args.keep_source_back5)
     print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
           f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
     if n_review:
         print(f"  {n_review} item(s) need a quick manual look in the "
               "'Review Queue' tab — the site's UPC column matched but "
               "CsUPC never did, so they weren't auto-confirmed as stocked.")
-    if not finished:
-        print("Run was stopped early / partial — re-run the same command to resume.")
+    # ---- Final reconciliation — must add up to the full search list ----
+    print_run_summary(prog.get("run_log"), unique_front5, n, n_review, finished)
+
+
+def print_run_summary(run_log, unique_front5, n_matched, n_review, finished):
+    """Print the end-of-run reconciliation. Never reports success while any
+    front5 errored or was never attempted."""
+    tally, _ = run_log_tally(run_log, unique_front5)
+    n_err = tally["error"]
+    n_missing = tally["not attempted"]
+    print("\n" + "=" * 70)
+    print("RUN SUMMARY")
+    print("=" * 70)
+    print(f"  FRONT5 values in search list : {len(unique_front5)}")
+    print(f"  Searches with results (hit)  : {tally['hit']}")
+    print(f"  Searches with zero results   : {tally['zero']}")
+    print(f"  Searches that errored        : {n_err}")
+    print(f"  Never attempted              : {n_missing}")
+    print(f"  Reconciles to                : {sum(tally.values())} "
+          f"({'OK' if sum(tally.values()) == len(unique_front5) else 'MISMATCH'})")
+    print(f"  Items matched (Stocked)      : {n_matched}")
+    print(f"  Items in Review Queue        : {n_review}")
+    print("  Full per-front5 detail is in the 'Run Log' tab.")
+    if n_err or n_missing:
+        print("\n  RESULT: NOT CLEAN — "
+              f"{n_err} error(s), {n_missing} never attempted. The matched "
+              "set is INCOMPLETE; re-run the same command to retry the "
+              "failed front5 values before trusting the output.")
+    elif finished is False:
+        print("\n  RESULT: PARTIAL — run was stopped early. Re-run the same "
+              "command to resume.")
     else:
-        print("Done. All chunks processed.")
+        print("\n  RESULT: CLEAN — all searches accounted for, no errors.")
 
 
 if __name__ == "__main__":

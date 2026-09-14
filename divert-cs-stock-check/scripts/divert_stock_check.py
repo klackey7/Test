@@ -969,7 +969,7 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
         excluded: front5, brand, description, csupc, reason, pk_sz, dcs,
         no_buys.
     """
-    matched = {}      # row_idx -> set of No Buy values
+    matched = {}      # row_idx -> {"no_buy": set, "pk_sz": set, "description": set}
     reviewed = {}      # row_idx -> list of contributing scraped-row dicts
     samples = []      # for validation printout
 
@@ -987,10 +987,17 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
             hit_rows = by_back5.get(c5) if c5 else None
             if hit_rows:
                 no_buy = (res.get("No Buy") or "").strip()
+                pk_sz = (res.get("Pk/Sz") or "").strip()
+                desc = (res.get("Description") or "").strip()
                 for ridx in hit_rows:
-                    matched.setdefault(ridx, set())
+                    m = matched.setdefault(
+                        ridx, {"no_buy": set(), "pk_sz": set(), "description": set()})
                     if no_buy != "":
-                        matched[ridx].add(no_buy)
+                        m["no_buy"].add(no_buy)
+                    if pk_sz != "":
+                        m["pk_sz"].add(pk_sz)
+                    if desc != "":
+                        m["description"].add(desc)
                     if len(samples) < verbose_sample:
                         samples.append((f5, rows[ridx], res, c5))
                 continue
@@ -1062,12 +1069,28 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
         match_type[ridx] = "item code (site UPC)"
 
     out = {}
+    site_detail = {}   # ridx -> {"description": str, "pk_sz": str} — the
+                       # site's OWN description/pack-size, distinct from the
+                       # research row's. Exposed on the Stocked tab so a
+                       # case-code match can be pack/size-verified the same
+                       # way an item-code match already can via Review Queue.
     for ridx, vals in matched.items():
-        out[ridx] = ", ".join(sorted(vals)) if vals else ""
+        out[ridx] = ", ".join(sorted(vals["no_buy"])) if vals["no_buy"] else ""
+        site_detail[ridx] = {
+            "description": ", ".join(sorted(vals["description"])),
+            "pk_sz": ", ".join(sorted(vals["pk_sz"])),
+        }
     for ridx in review_only:
-        vals = {str(e.get("no_buy", "")).strip() for e in reviewed[ridx]}
-        vals = {v for v in vals if v}
-        out[ridx] = ", ".join(sorted(vals)) if vals else ""
+        entries = reviewed[ridx]
+        nb = {str(e.get("no_buy", "")).strip() for e in entries}
+        nb = {v for v in nb if v}
+        out[ridx] = ", ".join(sorted(nb)) if nb else ""
+        descs = {str(e.get("description", "")).strip() for e in entries}
+        pksz = {str(e.get("pk_sz", "")).strip() for e in entries}
+        site_detail[ridx] = {
+            "description": ", ".join(sorted(d for d in descs if d)),
+            "pk_sz": ", ".join(sorted(p for p in pksz if p)),
+        }
 
     # Review Queue keeps the per-DC site detail for every item-code match,
     # so they can still be eyeballed row by row. They are no longer
@@ -1207,7 +1230,7 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
               "(a front5 can be shared by unrelated vendors).")
         print("  Re-run with --lookfor-audit to see every excluded item and why.")
 
-    return out, review_out, lookfor_list, lookfor_rejected, match_type
+    return out, review_out, lookfor_list, lookfor_rejected, match_type, site_detail
 
 
 def diagnose_matching(rows, front5_index, prog):
@@ -1289,7 +1312,8 @@ def helper_col_fixups(headers):
 
 def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
                  lookfor_rejected=None, run_log=None, unique_front5=None,
-                 prep_audit=None, keep_source_helpers=False, match_type=None):
+                 prep_audit=None, keep_source_helpers=False, match_type=None,
+                 site_detail=None):
     """Write the matches-only 'Stocked' tab, a 'Review Queue' tab, a
     'Stocked Vendor Lines' tab, and a 'Lookfor' tab.
 
@@ -1339,12 +1363,16 @@ def write_output(headers, rows, no_buy_map, review_map, lookfor_list, out_path,
     # code (CsUPC) or the item code (the site's own UPC column). Both are
     # exact matches; CsUPC is simply not the item code for every vendor.
     mt = match_type or {}
-    ws.append(list(headers) + ["No Buy", "Matched On"])
+    sd = site_detail or {}
+    ws.append(list(headers) + ["No Buy", "Matched On", "Site Description",
+                                "Site Pk/Sz"])
 
     n = 0
     for ridx in sorted(no_buy_map.keys()):
+        detail = sd.get(ridx, {})
         ws.append(display_values(rows[ridx])
-                  + [no_buy_map[ridx], mt.get(ridx, "case code (CsUPC)")])
+                  + [no_buy_map[ridx], mt.get(ridx, "case code (CsUPC)"),
+                     detail.get("description", ""), detail.get("pk_sz", "")])
         n += 1
 
     ws2 = wb.create_sheet("Review Queue")
@@ -1592,26 +1620,39 @@ def write_share_summary(headers, rows, no_buy_map, lookfor_list, out_path,
     return len(out_rows)
 
 
-def _no_buy_is_clean_no(no_buy_str) -> bool:
-    """True only if every distinct No Buy value seen for a row is exactly
-    'No' (case-insensitive) — a single, unambiguous value. Confirmed
-    2026-08-24: the account-manager-ready Final Review deliberately drops
-    any row with a discrepancy across DCs (e.g. 'No' at one DC, 'Yes' at
-    another) rather than resolving it automatically — there are too many to
-    adjudicate one by one, and an inconsistent row isn't action-ready."""
+def _no_buy_is_clean_no(no_buy_str, strict=False) -> bool:
+    """True if the item is confirmed sellable — Final Review's inclusion
+    rule for No Buy.
+
+    CORRECTED 2026-09-14, at the user's explicit direction: default is now
+    'No' at ANY DC that matched is sufficient — 'a DC saying No Buy = No
+    means I can sell this item there', regardless of what other DCs said.
+    The original 2026-08-24 rule required EVERY DC's value to be exactly
+    'No' and dropped the entire item on a single stray 'Yes' elsewhere —
+    stricter than the user's stated criteria (UPC matches, pack/size
+    match, No Buy = No) and it was silently discarding genuinely sellable
+    items from the account-manager document over an unrelated DC's policy.
+    A blank/no-value row is still excluded either way — no evidence isn't
+    evidence of 'No'. Pass strict=True (CLI: --strict-no-buy) to restore
+    the original unanimous-No-only rule."""
     vals = {v.strip().lower() for v in str(no_buy_str or "").split(",") if v.strip()}
-    return vals == {"no"}
+    if not vals:
+        return False
+    return vals == {"no"} if strict else "no" in vals
 
 
-def _review_no_buy_is_clean_no(entries) -> bool:
+def _review_no_buy_is_clean_no(entries, strict=False) -> bool:
     """Same rule as _no_buy_is_clean_no, applied to a Review Queue row's
     list of contributing scraped-row dicts instead of a pre-joined string."""
     vals = {e.get("no_buy", "").strip().lower() for e in entries if e.get("no_buy", "").strip()}
-    return vals == {"no"}
+    if not vals:
+        return False
+    return vals == {"no"} if strict else "no" in vals
 
 
 def write_final_review(headers, rows, no_buy_map, review_map, out_path,
-                       keep_source_helpers=False, match_type=None):
+                       keep_source_helpers=False, match_type=None,
+                       strict_no_buy=False):
     """Write the account-manager-ready Final Review workbook — the shape
     proven out by hand on the real Coffees & Teas run and confirmed
     2026-08-24: same columns as the research file (no added columns, since
@@ -1659,11 +1700,11 @@ def write_final_review(headers, rows, no_buy_map, review_map, out_path,
     included = []  # (row_idx, bold)
     for ridx in range(len(rows)):
         if ridx in no_buy_map:
-            if _no_buy_is_clean_no(no_buy_map[ridx]):
+            if _no_buy_is_clean_no(no_buy_map[ridx], strict=strict_no_buy):
                 is_case = mt.get(ridx, "case code (CsUPC)").startswith("case")
                 included.append((ridx, is_case))
         elif ridx in review_map:
-            if _review_no_buy_is_clean_no(review_map[ridx]):
+            if _review_no_buy_is_clean_no(review_map[ridx], strict=strict_no_buy):
                 included.append((ridx, False))
 
     if brand_idx is None:
@@ -1762,6 +1803,13 @@ def main():
                          "no courtesy delay and a single chunk. Progress is "
                          "still saved every --save-every searches, so the run "
                          "stays resumable.")
+    ap.add_argument("--strict-no-buy", action="store_true",
+                    help="Restore the pre-2026-09-14 Final Review rule: "
+                         "include an item only if No Buy is 'No' at EVERY "
+                         "DC it matched, dropping it entirely on a single "
+                         "stray 'Yes' elsewhere. Default (recommended) is "
+                         "'No' at ANY matching DC confirms it's sellable "
+                         "there, per the user's stated criteria.")
     ap.add_argument("--legacy-csupc-only", action="store_true",
                     help="Restore the pre-2026-09-14 rule: confirm a match "
                          "ONLY on CsUPC, and treat a site-UPC-column match as "
@@ -1852,7 +1900,7 @@ def main():
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
         (no_buy_map, review_map, lookfor_list, lookfor_rejected,
-         match_type) = match_and_report(
+         match_type, site_detail) = match_and_report(
             rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx,
             legacy_csupc_only=args.legacy_csupc_only)
         n, n_review, n_vendor, n_lookfor = write_output(
@@ -1861,7 +1909,7 @@ def main():
             run_log=prog.get("run_log"), unique_front5=unique_front5,
             prep_audit=prep_audit,
             keep_source_helpers=args.keep_source_back5,
-            match_type=match_type)
+            match_type=match_type, site_detail=site_detail)
         print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
               f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
               f"Lookfor rows to {out_path}")
@@ -1872,7 +1920,7 @@ def main():
         n_bold, n_plain = write_final_review(
             headers, rows, no_buy_map, review_map, final_path,
             keep_source_helpers=args.keep_source_back5,
-            match_type=match_type)
+            match_type=match_type, strict_no_buy=args.strict_no_buy)
         print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
               f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
         print_run_summary(prog.get("run_log"), unique_front5, n, n_review,
@@ -1949,7 +1997,7 @@ def main():
 
     # ---- Match + write output (always, so partial progress is usable) ----
     (no_buy_map, review_map, lookfor_list, lookfor_rejected,
-     match_type) = match_and_report(
+     match_type, site_detail) = match_and_report(
         rows, front5_index, prog, brand_idx=brand_idx, desc_idx=desc_idx,
         legacy_csupc_only=args.legacy_csupc_only)
     n, n_review, n_vendor, n_lookfor = write_output(
@@ -1958,7 +2006,7 @@ def main():
         run_log=prog.get("run_log"), unique_front5=unique_front5,
         prep_audit=prep_audit,
         keep_source_helpers=args.keep_source_back5,
-        match_type=match_type)
+        match_type=match_type, site_detail=site_detail)
     print(f"\nWrote {n} matched rows, {n_review} Review Queue rows, "
           f"{n_vendor} Stocked Vendor Lines rows, and {n_lookfor} "
           f"Lookfor rows to {out_path}")
@@ -1969,7 +2017,7 @@ def main():
     n_bold, n_plain = write_final_review(
         headers, rows, no_buy_map, review_map, final_path,
         keep_source_helpers=args.keep_source_back5,
-        match_type=match_type)
+        match_type=match_type, strict_no_buy=args.strict_no_buy)
     print(f"Wrote Final Review to {final_path}: {n_bold} case-code "
           f"(bold) + {n_plain} item-code (plain) rows, {n_bold + n_plain} total.")
     if n_review:

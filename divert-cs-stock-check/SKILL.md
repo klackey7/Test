@@ -284,6 +284,43 @@ worse than a miss.
    searches (default 25) *within* a chunk, so `--chunks 1` / `--full-speed`
    stays resumable rather than risking the whole run on one save point.
 
+## Final Review inclusion: "No" at ANY matching DC confirms sellable
+
+**CORRECTED 2026-09-14, at the user's explicit direction.** The original
+2026-08-24 rule (`_no_buy_is_clean_no`) required EVERY DC that matched an
+item to show No Buy = "No" — a single "Yes" at any other DC dropped the
+item from Final Review entirely, even though "No" at even one DC already
+proves you can source it there.
+
+The user's stated criteria for what belongs on the final doc: an item
+populates on the Product List after searching its front5, the UPC matches,
+pack/size match, and No Buy = "No". That's an ANY-DC test, not a
+unanimous one. Default behavior is now: **the item is confirmed sellable
+if "No" appears among the No Buy values seen at ANY matching DC**,
+regardless of what other DCs said. A row with no No Buy value captured at
+all is still excluded (no evidence isn't evidence of "No"), and a row
+whose *only* value is "Yes" stays excluded. `--strict-no-buy` restores the
+original unanimous-No-only rule for reproducing an earlier run.
+
+This only changes Final Review's inclusion filter. The Stocked tab's own
+`No Buy` column always shows every distinct value seen (e.g. `"No, Yes"`)
+regardless of which rule is active — nothing about what counts as
+"matched" changed, only what counts as "confirmed sellable enough to put
+in front of an account manager."
+
+### Site detail on the Stocked tab, for pack/size verification
+
+Added 2026-09-14: the Stocked tab now carries **Site Description** and
+**Site Pk/Sz** — the values scraped directly from the Product List, not
+your research file's own description/pack/size — for every row, matched
+on either tier. Review Queue already had this for item-code matches; case-
+code matches previously had no way to visually confirm pack/size agreement
+the way item-code matches did. Purely additive and display-only: nothing
+is auto-excluded on a pack/size mismatch (site and research-file pack/size
+conventions differ too much in formatting to string-compare safely without
+risking new false exclusions) — it's there for the same manual eyeball
+check already established for plain-tier rows.
+
 ## Dedup across DCs
 
 A matched item can appear under multiple DCs in one search. Collapse these into
@@ -514,6 +551,9 @@ python scripts/divert_stock_check.py --input RESEARCH.xlsx --rebuild-output
   manufacturer item code (NEAR EAST, front5 `72251`) still reports its
   stocked items in Stocked, in the account-manager summary, and qualifies
   for Lookfor. Regression: `72251` must yield 9 stocked items, not 0.
+- A matched item with No Buy = "No" at one DC and "Yes" at another appears
+  in Final Review (default); `--strict-no-buy` excludes it. An item with
+  No Buy = "Yes" at every DC that matched it is excluded either way.
 
 ## Script
 

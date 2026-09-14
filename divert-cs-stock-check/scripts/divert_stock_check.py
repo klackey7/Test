@@ -466,8 +466,20 @@ def chunk_list(items, n):
 # Progress (resume) file
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_progress(path, expected_chunks, input_path):
-    """Load progress JSON if valid for this input, else start fresh."""
+def load_progress(path, expected_chunks, input_path, require_chunk_layout=True):
+    """Load progress JSON if valid for this input, else start fresh.
+
+    require_chunk_layout=True (the searching path) also requires the exact
+    chunk PARTITION to match --chunks from the prior run, since resuming
+    relies on completed_chunks indexing into that same partition.
+
+    require_chunk_layout=False (the --rebuild-output / --diagnose paths,
+    which never search) only needs the underlying front5 SET to match —
+    chunk count is irrelevant when nothing is being resumed. FIXED
+    2026-09-14: previously used the same strict chunks == check for both,
+    so a fully-searched progress file from a `--full-speed` (--chunks 1)
+    run was discarded by `--rebuild-output`'s default --chunks 5, with the
+    misleading message "Front5 set changed" even though it hadn't."""
     if not os.path.exists(path):
         return None
     try:
@@ -479,11 +491,28 @@ def load_progress(path, expected_chunks, input_path):
     if prog.get("input_file") != os.path.abspath(input_path):
         print("  Progress file is for a different input — starting fresh.")
         return None
-    if prog.get("chunks") != expected_chunks:
-        print("  Front5 set changed since last run — starting fresh.")
+    expected_set = sorted(f5 for chunk in expected_chunks for f5 in chunk)
+    saved_chunks = prog.get("chunks") or []
+    saved_set = sorted(f5 for chunk in saved_chunks for f5 in chunk)
+    if saved_set != expected_set:
+        print("  Front5 set changed since last run (research file content "
+              "differs) — starting fresh.")
         return None
-    done = len(prog.get("completed_chunks", []))
-    print(f"  Resuming: {done}/{len(expected_chunks)} chunks already completed.")
+    if require_chunk_layout and saved_chunks != expected_chunks:
+        print("  Progress file uses a different --chunks layout than this "
+              "run — starting fresh. Pass the same --chunks value used "
+              "originally to resume, or use --rebuild-output (chunk layout "
+              "doesn't matter there).")
+        return None
+    if require_chunk_layout:
+        done = len(prog.get("completed_chunks", []))
+        print(f"  Resuming: {done}/{len(expected_chunks)} chunks already "
+              "completed.")
+    else:
+        n_searched = len(prog.get("searched_front5", []))
+        print(f"  Loaded progress: {n_searched}/{len(expected_set)} front5 "
+              "values searched (chunk layout ignored for this read-only "
+              "path).")
     return prog
 
 
@@ -1809,7 +1838,8 @@ def main():
 
     # ---- Diagnose-only path (no browser, no output file) ----
     if args.diagnose:
-        prog = load_progress(progress_path, chunks, args.input)
+        prog = load_progress(progress_path, chunks, args.input,
+                             require_chunk_layout=False)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to diagnose.")
         diagnose_matching(rows, front5_index, prog)
@@ -1817,7 +1847,8 @@ def main():
 
     # ---- Rebuild-output-only path (no browser) ----
     if args.rebuild_output:
-        prog = load_progress(progress_path, chunks, args.input)
+        prog = load_progress(progress_path, chunks, args.input,
+                             require_chunk_layout=False)
         if not prog:
             raise SystemExit("ERROR: no valid progress file to rebuild from.")
         (no_buy_map, review_map, lookfor_list, lookfor_rejected,

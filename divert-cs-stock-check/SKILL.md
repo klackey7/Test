@@ -237,6 +237,43 @@ on such a vendor can be a **false positive** (a research item whose item code
 happens to equal C&S's case code for a different product). The `Matched On`
 column makes these identifiable for spot-checking.
 
+### Dual-code files: GTIN-12 (item) + GTIN-14 (case)
+
+**Added 2026-09-15, rules confirmed by the user.** Some vendor price lists
+publish BOTH identifiers per item instead of a single UPC-A. The Emmi-Roth
+2026 price list is the first of these.
+
+| Code | Rule | Yields | Matches the site's |
+|---|---|---|---|
+| **GTIN-12** (item code) | drop first digit and last digit | `pad12[1:6]` front5, `pad12[6:11]` back5 | **UPC** column |
+| **GTIN-14** (case code) | drop first THREE digits and last digit | `d14[3:8]` front5, `d14[8:13]` case code | **CsUPC** column |
+
+e.g. GTIN-14 `10070277000055` -> front5 `70277`, case code `00005`.
+
+This is the same two-tier structure the skill already matches on — it just
+gets the authoritative code for each tier directly from the file instead of
+deriving one back5 and testing it against both fields. Each code is now
+compared only against its own site field.
+
+**The two codes legitimately differ.** In the Emmi-Roth file, 10 of the 100
+rows carrying both codes have an item code and a case code that are entirely
+different numbers (e.g. item `56630` vs case `01974`). That is not a data
+error — it is the same distinction as NEAR EAST's `CsUPC 02052` against item
+UPC `00050`. Never "reconcile" them.
+
+**Rows may carry only one code.** 72 of 172 Emmi-Roth rows have no GTIN-12 at
+all (`"NA"` or blank) — 51 of those are random-weight items, which often have
+no consumer UPC-A. Those rows fall back to the case code for both front5 and
+matching, so they are still searched and still matchable.
+
+**Implementation.** `read_research` looks for an optional case column named
+any of `CASE UPC`, `GTIN-14`, `GTIN-14 UPC CODE`, `CASE GTIN`. When absent,
+every row gets one back5 used for both comparisons and behavior is byte-for-
+byte what it was before — verified against the Baking Brands file (901 rows,
+67 front5, zero case codes, back5 unchanged). `offer_back5s` (the Lookfor
+"already on the offer" gate) checks item AND case codes, so an item matched
+on its case code cannot reappear in Lookfor.
+
 ### Matching a scraped result back to the research file
 For each scraped result row, take the site's **CsUPC**, normalize it to a
 5-character zero-padded string (`csupc5` — CsUPC may lose leading zeros as a

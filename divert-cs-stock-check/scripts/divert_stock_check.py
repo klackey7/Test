@@ -189,6 +189,28 @@ def back5(val) -> str:
     return p[6:11] if len(p) == 12 else ""
 
 
+def gtin14_front5(val) -> str:
+    """Front5 from a 14-digit case GTIN: characters [3:8].
+
+    Confirmed 2026-09-15 by the user as the authoritative rule for reading
+    a GTIN-14: "drop first three numbers and last number", leaving
+    front5 + case code. e.g. '10070277000055' -> front5 '70277',
+    case code '00005'. Verified against 90 rows of the Emmi-Roth file that
+    carry both a GTIN-12 and a GTIN-14; the 10 that differ do so because
+    the case code and item code are genuinely different numbers for the
+    same product, not because the rule is wrong."""
+    d = to_digits(val)
+    return d[3:8] if len(d) == 14 else ""
+
+
+def gtin14_case_back5(val) -> str:
+    """Case code from a 14-digit case GTIN: characters [8:13]. This is the
+    value C&S shows in its CsUPC column — the case-level identifier — as
+    distinct from the item code carried by a GTIN-12."""
+    d = to_digits(val)
+    return d[8:13] if len(d) == 14 else ""
+
+
 def format_upc_display(pad12_val: str, raw_val) -> str:
     """Dashed UPC-A for readability: system-mfr5-item5-check, e.g.
     '072310000414' -> '0-72310-00041-4'. Falls back to the original raw
@@ -372,6 +394,19 @@ def read_research(path: str):
 
     headers = [("" if h is None else str(h).strip()) for h in header_row]
 
+    # OPTIONAL case-level GTIN-14 column. When present, each row carries
+    # BOTH identifiers: the item code (from the GTIN-12 "UPC" column, which
+    # matches the site's UPC column) and the case code (from the GTIN-14,
+    # which matches the site's CsUPC column). Added 2026-09-15 for vendor
+    # files that publish both, e.g. the Emmi-Roth price list. Without this
+    # column the script behaves exactly as before: one back5 per row,
+    # compared against both site fields.
+    case_idx = None
+    for cand in ("CASE UPC", "GTIN-14", "GTIN-14 UPC CODE", "CASE GTIN"):
+        case_idx = find_header_index(headers, cand)
+        if case_idx is not None:
+            break
+
     upc_idx = find_header_index(headers, "UPC")
     if upc_idx is None:
         raise SystemExit(
@@ -391,11 +426,25 @@ def read_research(path: str):
             continue
         upc_val = values[upc_idx]
         p12 = pad12(upc_val)
+        item_front5 = p12[1:6] if len(p12) == 12 else ""
+        item_back5 = p12[6:11] if len(p12) == 12 else ""
+
+        case_front5 = case_back5 = ""
+        if case_idx is not None:
+            case_val = values[case_idx]
+            case_front5 = gtin14_front5(case_val)
+            case_back5 = gtin14_case_back5(case_val)
+
+        # A row may legitimately carry only one of the two codes (a random-
+        # weight item often has no consumer GTIN-12 at all). Fall back so the
+        # row is still searchable and matchable on whichever code it has.
         rows.append({
             "values": values,
             "pad12": p12,
-            "front5": p12[1:6] if len(p12) == 12 else "",
-            "back5": p12[6:11] if len(p12) == 12 else "",
+            "front5": item_front5 or case_front5,
+            "back5": item_back5 or case_back5,
+            "item_back5": item_back5,
+            "case_back5": case_back5,
         })
 
     print(f"  Read {len(rows)} data rows, skipped {blank_count} blank spacer rows.")
@@ -977,14 +1026,27 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
         candidates = front5_index.get(f5, [])
         if not candidates or not results:
             continue
-        # back5 -> [research row indices] for this front5
-        by_back5 = {}
+        # Two maps, one per site field. When a row carries only a single
+        # code both maps get the same value, so behavior is unchanged for
+        # every file that doesn't publish a separate case GTIN.
+        #   by_case_back5 -> compared against the site's CsUPC   (case code)
+        #   by_item_back5 -> compared against the site's UPC col (item code)
+        by_back5 = {}        # retained: Lookfor/diagnose still use it
+        by_case_back5 = {}
+        by_item_back5 = {}
         for ridx in candidates:
-            by_back5.setdefault(rows[ridx]["back5"], []).append(ridx)
+            r = rows[ridx]
+            by_back5.setdefault(r["back5"], []).append(ridx)
+            cb = r.get("case_back5") or r["back5"]
+            ib = r.get("item_back5") or r["back5"]
+            if cb:
+                by_case_back5.setdefault(cb, []).append(ridx)
+            if ib:
+                by_item_back5.setdefault(ib, []).append(ridx)
 
         for res in results:
             c5 = csupc5(res.get("CsUPC", ""))
-            hit_rows = by_back5.get(c5) if c5 else None
+            hit_rows = by_case_back5.get(c5) if c5 else None
             if hit_rows:
                 no_buy = (res.get("No Buy") or "").strip()
                 pk_sz = (res.get("Pk/Sz") or "").strip()
@@ -1008,7 +1070,7 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
             site_b5 = site_upc_back5(res.get("UPC", ""))
             if not site_b5:
                 continue
-            near_hit_rows = by_back5.get(site_b5)
+            near_hit_rows = by_item_back5.get(site_b5)
             if not near_hit_rows:
                 continue
             for ridx in near_hit_rows:
@@ -1123,7 +1185,18 @@ def match_and_report(rows, front5_index, prog, brand_idx=None, desc_idx=None,
         candidates = front5_index.get(f5, [])
         # Every back5 already present in the research file for this front5 —
         # regardless of match status — counts as "already on the offer."
-        offer_back5s = {rows[ridx]["back5"] for ridx in candidates}
+        # Every code the offer carries under this front5 — item codes AND
+        # case codes. Updated 2026-09-15: with a dual-code file, an item
+        # already matched on its case code would otherwise reappear in
+        # Lookfor as "C&S carries this and you don't", because only the
+        # item-code set was being checked.
+        offer_back5s = set()
+        for ridx in candidates:
+            r = rows[ridx]
+            for key in ("back5", "item_back5", "case_back5"):
+                v = r.get(key)
+                if v:
+                    offer_back5s.add(v)
 
         # ALL distinct brands the research file lists under this front5 —
         # not just the first. A research file can itself carry more than one

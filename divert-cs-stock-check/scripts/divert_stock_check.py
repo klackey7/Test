@@ -113,6 +113,13 @@ LOGIN_URL = "https://divert.cssourcing.com/login"
 # any real front5 lookup.
 PROBE_FRONT5 = "10095"
 
+# Consecutive zero-result searches after which the run warns. Not a hard
+# stop and not a verdict — a long streak can be genuine. It exists so a
+# soft block (an error page that still renders the search form, which the
+# PageNotReadyError check cannot catch) can never pass silently into the
+# output as "not stocked". Added 2026-09-15.
+ZERO_STREAK_WARN = 12
+
 # Expected Product List column headers (normalized key -> canonical name).
 # Header text is matched by normalizing (lowercase, whitespace removed) so
 # minor spacing differences don't break the mapping. If the live table's
@@ -794,6 +801,21 @@ def inspect_page(page):
     print("=" * 70)
 
 
+class PageNotReadyError(RuntimeError):
+    """The page currently loaded is not a usable Product Search page.
+
+    Added 2026-09-15 after a live run went to a blank white page mid-search.
+    scrape_results() previously returned [] whenever the results table was
+    absent, which meant a blank page, an error page, or a WAF/rate-limit
+    block was recorded as a legitimate ZERO-RESULT search — writing "C&S
+    does not stock this" into the output when the truth is "no answer was
+    ever received". That is the exact failure this skill's Run Log exists
+    to prevent (a silent zero and a failed request must never look the
+    same), so it is now an error that retries with backoff and, if it
+    persists, is logged as an error rather than a zero.
+    """
+
+
 def scrape_results(page):
     """Scrape the Product List table on the current page.
 
@@ -805,7 +827,21 @@ def scrape_results(page):
     """
     table = page.query_selector(SELECTORS["results_table"])
     if table is None:
-        return []  # zero results / no table rendered — skip silently
+        # Distinguish "search ran, nothing matched" from "this isn't the
+        # search page at all". On a real results page the search form is
+        # always still present (confirmed on every --inspect run to date),
+        # so its ABSENCE means the page is blank/errored/blocked rather
+        # than genuinely empty. Uses only selectors already confirmed
+        # live — no guessing at error-page markup.
+        if page.query_selector(SELECTORS["upc_input"]) is None:
+            raise PageNotReadyError(
+                "results table absent AND the search input "
+                f"({SELECTORS['upc_input']}) is gone — the page is not a "
+                "usable Product Search page (blank, error, session expired, "
+                "or rate-limited). Treating as a failed request, NOT as a "
+                "zero-result search."
+            )
+        return []  # search form still present, table absent => real zero
 
     trs = table.query_selector_all("tr")
     if not trs:
@@ -866,6 +902,16 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
     since_save = 0
     run_log = prog.setdefault("run_log", {})
 
+    # A soft block (an error page that still renders the search form) would
+    # pass the PageNotReadyError check and look like a run of real zeros.
+    # We cannot tell that apart from genuinely-not-stocked keys without
+    # guessing, so we do not try — we count the streak and warn loudly, and
+    # the streak is reported in the run summary so it can never pass
+    # unnoticed. Added 2026-09-15.
+    zero_streak = 0
+    max_zero_streak = prog.get("max_zero_streak", 0)
+    warned_streak = False
+
     for local_i, chunk in enumerate(remaining_chunks):
         chunk_idx = chunk_offset + local_i
         print(f"\n--- Chunk {chunk_idx + 1}/{total_chunks} "
@@ -925,6 +971,21 @@ def run_searches(page, remaining_chunks, chunk_offset, prog, progress_path,
                                "error": ""}
                 print(f"    {f5}: {len(results)} result rows"
                       if results else f"    {f5}: 0 results (zero-result)")
+                if results:
+                    zero_streak = 0
+                else:
+                    zero_streak += 1
+                    max_zero_streak = max(max_zero_streak, zero_streak)
+                    prog["max_zero_streak"] = max_zero_streak
+                    if zero_streak >= ZERO_STREAK_WARN and not warned_streak:
+                        warned_streak = True
+                        print(f"\n  !! WARNING: {zero_streak} consecutive "
+                              "zero-result searches. That can be genuine, but "
+                              "it is also what a soft rate-limit/block looks "
+                              "like once the site starts returning an empty "
+                              "results page. Spot-check one of these front5 "
+                              "values by hand in the browser before trusting "
+                              "these as 'not stocked'.\n")
 
             if f5 not in prog["searched_front5"]:
                 prog["searched_front5"].append(f5)
@@ -2011,7 +2072,8 @@ def main():
               "'Matched On' on the Stocked tab still shows which field "
               "proved each one).")
         print_run_summary(prog.get("run_log"), unique_front5, n, n_review,
-                          finished=None)
+                          finished=None,
+                          max_zero_streak=prog.get("max_zero_streak", 0))
         return
 
     # ---- Load / init progress ----
@@ -2114,10 +2176,12 @@ def main():
               "'Review Queue' tab — the site's UPC column matched but "
               "CsUPC never did, so they weren't auto-confirmed as stocked.")
     # ---- Final reconciliation — must add up to the full search list ----
-    print_run_summary(prog.get("run_log"), unique_front5, n, n_review, finished)
+    print_run_summary(prog.get("run_log"), unique_front5, n, n_review, finished,
+                      max_zero_streak=prog.get("max_zero_streak", 0))
 
 
-def print_run_summary(run_log, unique_front5, n_matched, n_review, finished):
+def print_run_summary(run_log, unique_front5, n_matched, n_review, finished,
+                      max_zero_streak=0):
     """Print the end-of-run reconciliation. Never reports success while any
     front5 errored or was never attempted."""
     tally, _ = run_log_tally(run_log, unique_front5)
@@ -2135,7 +2199,15 @@ def print_run_summary(run_log, unique_front5, n_matched, n_review, finished):
           f"({'OK' if sum(tally.values()) == len(unique_front5) else 'MISMATCH'})")
     print(f"  Items matched (Stocked)      : {n_matched}")
     print(f"  Items in Review Queue        : {n_review}")
+    if max_zero_streak:
+        print(f"  Longest zero-result streak     : {max_zero_streak}"
+              + ("  <-- CHECK THIS" if max_zero_streak >= ZERO_STREAK_WARN else ""))
     print("  Full per-front5 detail is in the 'Run Log' tab.")
+    if max_zero_streak >= ZERO_STREAK_WARN:
+        print(f"\n  NOTE: {max_zero_streak} zero-results in a row occurred at "
+              "some point in this run. That may be genuine, but it is also "
+              "the signature of a soft block. Hand-check one of those front5 "
+              "values on the site before treating them as 'not stocked'.")
     if n_err or n_missing:
         print("\n  RESULT: NOT CLEAN — "
               f"{n_err} error(s), {n_missing} never attempted. The matched "

@@ -387,6 +387,55 @@ conventions differ too much in formatting to string-compare safely without
 risking new false exclusions) — it's there for the same manual eyeball
 check already established for plain-tier rows.
 
+## A non-results page is an ERROR, never a zero-result
+
+**Added 2026-09-15 after a live Bars Brands run went to a blank white page
+mid-search.** `scrape_results()` previously returned `[]` whenever the
+results table was absent:
+
+```python
+table = page.query_selector(SELECTORS["results_table"])
+if table is None:
+    return []   # <-- blank page, error page, or WAF block all land here
+```
+
+So a blank/errored/blocked page was recorded as a legitimate **zero-result
+search** — writing "C&S does not stock this" into the output when the truth
+was "no answer was ever received." That is precisely the failure the Run Log
+exists to prevent, and it is worse than a crash because it fails silently
+into the deliverable instead of stopping the run.
+
+**The discriminator, using only selectors already confirmed live:** on a real
+Product Search page the search form is always present, even when zero rows
+match. So:
+
+| Results table | Search input (`#MainContent_upc`) | Verdict |
+|---|---|---|
+| present | — | scrape rows normally |
+| absent | **present** | genuine zero-result |
+| absent | **absent** | `PageNotReadyError` — retried with backoff, logged as an **error** |
+
+`PageNotReadyError` subclasses `Exception`, so the existing retry/backoff in
+`run_searches` catches it; `SystemExit` (the never-guess header hard-stop)
+still propagates un-retried.
+
+### Zero-streak warning — the soft-block case
+
+A *soft* block that still renders the search form would pass the check above
+and look like a run of real zeros. There is no way to tell that apart from
+genuinely-not-stocked keys without guessing, so the skill does not try. It
+counts consecutive zero-results, warns loudly at `ZERO_STREAK_WARN` (12),
+and reports the longest streak in the run summary and against the run's
+stored progress. It is a flag for a human to spot-check, never a verdict.
+
+### Pacing note
+
+`--full-speed` issues back-to-back ASP.NET postbacks with zero delay, which
+is a plausible rate-limit/bot-detection trigger on this site. For small key
+counts the default 1-3s courtesy delay costs almost nothing — prefer it.
+Reserve `--full-speed` for large runs where the time actually matters, and
+check the zero-streak line in the summary afterwards.
+
 ## Dedup across DCs
 
 A matched item can appear under multiple DCs in one search. Collapse these into
